@@ -1,0 +1,50 @@
+# Visual Studio
+.vs/
+*.db
+*.opendb
+*.ipch
+*.suo
+*.user
+*.cache
+
+# Build outputs & Intermediate files
+Debug/
+Release/
+x64/
+[Bb]in/
+[Oo]bj/
+ELECTROMAGNETIC_TOOLS_3.0/x64/
+ELECTROMAGNETIC_TOOLS_3.0/Debug/
+ELECTROMAGNETIC_TOOLS_3.0/Release/
+
+# Compiled binaries and intermediates
+*.dll
+*.exe
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.res
+*.resources
+*.metagen
+*.tlog
+*.lastbuildstate
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Test / large data
+*.las
+*.bin
+*.jpg
+*.png
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local agent configuration
+.devin/*.local.json
+
