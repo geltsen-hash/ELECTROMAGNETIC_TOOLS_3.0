@@ -93,6 +93,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="pch.h" />
+    <ClInclude Include="SondeDataTypes.h" />
+    <ClInclude Include="BinFileReader.h" />
     <ClInclude Include="MainForm.h">
       <FileType>CppForm</FileType>
     </ClInclude>
@@ -105,6 +107,10 @@
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="BinFileReader.cpp">
+      <CompileAsManaged>false</CompileAsManaged>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="MainForm.cpp" />
     <ClCompile Include="MetroForm.cpp" />
@@ -119,12 +125,29 @@
     </EmbeddedResource>
   </ItemGroup>
   <ItemGroup>
+    <Reference Include="EmUpdate">
+      <HintPath>$(OutDir)EmUpdate.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="System" />
     <Reference Include="System.Data" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Windows.Forms.DataVisualization" />
     <Reference Include="System.Xml" />
+  </ItemGroup>
+  <Target Name="BuildUpdateAgent" BeforeTargets="ResolveAssemblyReferences;ClCompile" Inputs="$(MSBuildProjectDirectory)\..\UpdateAgent.cs;$(MSBuildProjectDirectory)\..\PythonRuntime.cs;$(MSBuildProjectFullPath)" Outputs="$(OutDir)EmUpdate.exe">
+    <MakeDir Directories="$(OutDir)" />
+    <Exec Command="&quot;$(SystemRoot)\Microsoft.NET\Framework64\v4.0.30319\csc.exe&quot; /nologo /target:exe /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll /r:System.Security.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /out:&quot;$(OutDir)EmUpdate.exe&quot; &quot;$(MSBuildProjectDirectory)\..\UpdateAgent.cs&quot; &quot;$(MSBuildProjectDirectory)\..\PythonRuntime.cs&quot;" />
+  </Target>
+  <Target Name="BuildPublishAgent" BeforeTargets="ResolveAssemblyReferences;ClCompile" Inputs="$(MSBuildProjectDirectory)\..\EmPublish.cs;$(MSBuildProjectFullPath)" Outputs="$(OutDir)EmPublish.exe">
+    <MakeDir Directories="$(OutDir)" />
+    <Exec Command="&quot;$(SystemRoot)\Microsoft.NET\Framework64\v4.0.30319\csc.exe&quot; /nologo /target:exe /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll /r:System.Security.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /out:&quot;$(OutDir)EmPublish.exe&quot; &quot;$(MSBuildProjectDirectory)\..\EmPublish.cs&quot;" />
+  </Target>
+  <ItemGroup>
+    <None Include="..\UpdateAgent.cs" />
+    <None Include="..\PythonRuntime.cs" />
+    <None Include="..\EmPublish.cs" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
