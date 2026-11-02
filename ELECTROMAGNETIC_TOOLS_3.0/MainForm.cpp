@@ -3,11 +3,24 @@
 #include "MetroForm.h"
 #include "BinFileReader.h"
 #include <msclr/marshal_cppstd.h>
+#include <msclr/lock.h>
 #include <iostream>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <utility>
 
 namespace ELECTROMAGNETIC_TOOLS_3_0 {
+
+	// std::string в UTF-8 → System::String (gcnew String(c_str()) ломает кириллицу)
+	static String^ Utf8ToManaged(const char* s)
+	{
+		if (s == nullptr) return L"";
+		int len = (int)strlen(s);
+		cli::array<Byte>^ bytes = gcnew cli::array<Byte>(len);
+		for (int i = 0; i < len; i++) bytes[i] = (Byte)(uint8_t)s[i];
+		return System::Text::Encoding::UTF8->GetString(bytes);
+	}
 
 	using namespace System;
 	using namespace System::ComponentModel;
@@ -85,12 +98,14 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		leg->BackColor = Color::Transparent;
 		chart->Legends->Add(leg);
 
+		// Палитра передатчиков — как на схеме зонда и в старой программе:
+		// T1 зелёный, T2 золотисто-коричневый, T3 красный, T4 синий, T5 маджента
 		cli::array<Color>^ colors = gcnew cli::array<Color>(5) {
+			Color::Green,
+			Color::DarkGoldenrod,
+			Color::Red,
 			Color::RoyalBlue,
-			Color::Crimson,
-			Color::ForestGreen,
-			Color::DarkOrange,
-			Color::DarkViolet
+			Color::Magenta
 		};
 
 		for (int i = 0; i < 5; i++)
@@ -207,8 +222,29 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		// Инициализация списков закрепленных кнопок
 		this->pinnedCurves1 = gcnew List<String^>();
 		this->pinnedCurves2 = gcnew List<String^>();
+		this->modePinnedCurves = gcnew cli::array<List<String^>^>(4);
+		this->modeActiveCurves = gcnew cli::array<String^>(4);
+		for (int mode = 0; mode < 4; ++mode) this->modePinnedCurves[mode] = gcnew List<String^>();
 		this->isDirectMode1 = false;
 		this->isDirectMode2 = false;
+		this->isCartographLayout = true;
+		this->receiverIndex1 = 0;
+		this->receiverIndex2 = 0;
+		this->buttonReceiver1 = gcnew Button();
+		this->buttonReceiver2 = gcnew Button();
+		for (int window = 1; window <= 2; ++window)
+		{
+			Button^ button = window == 1 ? this->buttonReceiver1 : this->buttonReceiver2;
+			button->Name = L"buttonReceiver" + window.ToString();
+			button->Size = Drawing::Size(60, 24);
+			button->Font = gcnew Drawing::Font(L"Segoe UI", 8, FontStyle::Bold);
+			button->Text = L"Rx L";
+			button->Tag = window;
+			button->Visible = false;
+			button->Click += gcnew EventHandler(this, &MainForm::buttonReceiver_Click);
+			this->toolTipMain->SetToolTip(button, L"Направленный приёмник: левый (L) / правый (R)");
+			(window == 1 ? this->panelTime1Header : this->panelTime2Header)->Controls->Add(button);
+		}
 		this->isTempXAxis1 = false;
 		this->isTempXAxis2 = false;
 		this->precisionY1 = 0;
@@ -219,11 +255,47 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		this->maxFrame2 = -1;
 		this->isStreaming = false;
 		this->currentStreamPoint = 500;
+		this->telemetryRunning = false;
+		this->telemetryThread = nullptr;
+		this->frameQueue = gcnew System::Collections::Concurrent::ConcurrentQueue<cli::array<Byte>^>();
+		this->telemetryRx = 0;
+		this->telemetryTimeouts = 0;
+		this->telemetryCrcErr = 0;
+		this->liveFout = nullptr;
+		this->liveFileName = nullptr;
+		this->isLiveSession = false;
+		this->connectedSondeId = nullptr;
 		this->isSyncingSplitter = false;
 		this->isSidebarPinned = false;
+		this->lastShownTxCount = -1;
+
+		// Схема зондов: привязка к активному графику (аналог panel_Sonde_Picture из AIR_TEMP_1.0)
+		this->activeSchemeChart = 0;
+		this->sectorsCollapsedByUser = false;
+		this->sondeScheme = gcnew SondeSchemeControl();
+		this->sondeScheme->Dock = DockStyle::Bottom;
+		this->sondeScheme->Height = 104;
+		this->sondeScheme->SchemeClicked += gcnew SondeSchemeControl::SchemeClickedHandler(this, &MainForm::sondeScheme_SchemeClicked);
+		this->tabPageLogging->Controls->Add(this->sondeScheme);
+		// Порядок докинга: тулбар сверху, схема внизу, графики заполняют остаток
+		this->tabPageLogging->Controls->SetChildIndex(this->sondeScheme, 1);
+
+		// Стартовый размер окна по разрешению экрана: рабочая область >= Full HD —
+		// окно 1920 x <рабочая область> по центру; меньше — на весь экран
+		System::Drawing::Rectangle wa = Screen::PrimaryScreen->WorkingArea;
+		if (wa.Width >= 1920 && wa.Height >= 1000)
+		{
+			this->StartPosition = FormStartPosition::CenterScreen;
+			this->ClientSize = System::Drawing::Size(1920, wa.Height);
+		}
+		else
+		{
+			this->WindowState = FormWindowState::Maximized;
+		}
 
 		// Загрузка сохраненной конфигурации станции (быстрые кнопки, режимы)
 		LoadStationConfig();
+		UpdateSondeScheme();
 		EmTools::Updates::UpdateController::Attach(this, this->menuItemHelp);
 
 		// Заполнение тестовыми данными (500 точек) до открытия файла
@@ -256,6 +328,10 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 	{
 		if (String::IsNullOrEmpty(filePath)) return;
 
+		// Открытие файла — в любом случае останавливаем поток отображения
+		// и показываем файл целиком (запись из прибора продолжает идти в фоне)
+		StopDisplay();
+
 		this->Cursor = Cursors::WaitCursor;
 		try
 		{
@@ -263,6 +339,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			char errBuf[512] = { 0 };
 
 			bool ok = SondeData::LoadFile(nativePath.c_str(), errBuf, sizeof(errBuf));
+			this->isLiveSession = false; // сессия теперь — открытый файл, а не онлайн-кадры
 			if (!ok)
 			{
 				this->Cursor = Cursors::Default;
@@ -272,7 +349,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			}
 
 			size_t frameCount = SondeData::GetFrameCount();
-			String^ sondeName = gcnew String(SondeData::GetSondeName());
+			String^ sondeName = Utf8ToManaged(SondeData::GetSondeName());
 			String^ fileNameOnly = System::IO::Path::GetFileName(filePath);
 
 			this->statusLabelFile->Text = L"Файл: " + fileNameOnly + L" | " + sondeName + L" | Кадров: " + frameCount.ToString();
@@ -326,6 +403,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			}
 
 			RenderLoadedCurves();
+			UpdateSondeScheme();
 
 			this->chartTime1->ChartAreas[0]->CursorX->Position = 0;
 			this->chartTime2->ChartAreas[0]->CursorX->Position = 0;
@@ -340,95 +418,217 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 	static int GetCurveTypeByName(String^ name)
 	{
 		if (String::IsNullOrEmpty(name)) return SondeData::CURVE_PHASE_DIFF;
+		bool pc = name->EndsWith(L" PC") || name->Contains(L"from_computer");
+		if (name->StartsWith(L"Δφ SMT") || name->StartsWith(L"φ SMT") || name->StartsWith(L"PH_SMT"))
+			return pc ? SondeData::CURVE_PHASE_SMT_PC : SondeData::CURVE_PHASE_SMT;
+		if (name->StartsWith(L"RO Δφ") || name->StartsWith(L"RO φ") || name->StartsWith(L"УЭС_PH"))
+			return pc ? SondeData::CURVE_RHO_PHASE_PC : SondeData::CURVE_RHO_PHASE;
+		if (name->StartsWith(L"ATT SMT") || name->StartsWith(L"ATT_SMT"))
+			return pc ? SondeData::CURVE_ATT_SMT_PC : SondeData::CURVE_ATT_SMT;
+		if (name->StartsWith(L"RO ATT") || name->StartsWith(L"УЭС_ATT"))
+			return pc ? SondeData::CURVE_RHO_ATT_PC : SondeData::CURVE_RHO_ATT;
 
-		// Ненаправленные
+		// Точные короткие имена (новый формат); порядок — от длинных к коротким
+		if (name == L"AM silent ZX") return SondeData::CURVE_ZERO_AM_ZX;
+		if (name == L"AM silent")    return SondeData::CURVE_ZERO_AM_ZZ;
+		if (name == L"AM Z2/Z1")     return SondeData::CURVE_ATTENUATION;
+		if (name == L"AMP Z1")       return SondeData::CURVE_AMPLITUDE_RX1;
+		if (name == L"AMP Z2")       return SondeData::CURVE_AMPLITUDE_RX2;
+		if (name == L"Raw Δφ")        return SondeData::CURVE_PHASE_DIFF;
+		if (name == L"TEMP RZX")     return SondeData::CURVE_TEMP_RZX;
+		if (name == L"TEMP")         return SondeData::CURVE_TEMPERATURE;
+		if (name == L"Δφ SMT")        return SondeData::CURVE_PHASE_SMT;
+		if (name == L"RO Δφ")         return SondeData::CURVE_RHO_PHASE;
+		if (name == L"ATT SMT")      return SondeData::CURVE_ATT_SMT;
+		if (name == L"RO ATT")       return SondeData::CURVE_RHO_ATT;
+		if (name == L"ε RO")         return SondeData::CURVE_ERROR_RHO;
+		if (name == L"FRAME")        return SondeData::CURVE_FRAME_NUM;
+		if (name == L"ACCEL")        return SondeData::CURVE_ACCEL;
+		if (name == L"AM GEO SMT")   return SondeData::CURVE_GEO_AM_SMT;
+		if (name == L"AM GEO")       return SondeData::CURVE_GEO_AM;
+		if (name == L"Δφ GEO SMT")    return SondeData::CURVE_GEO_PH_SMT;
+		if (name == L"Δφ GEO")        return SondeData::CURVE_GEO_PH;
+		if (name == L"AM VZX")       return SondeData::CURVE_V_ZX;
+		if (name == L"AM VZZ")       return SondeData::CURVE_V_ZZ;
+		if (name == L"AM VXX")       return SondeData::CURVE_V_XX;
+		if (name == L"βz")           return SondeData::CURVE_BETTA_Z;
+		if (name == L"Δφ VZX/VZZ")    return SondeData::CURVE_RATIO_ZX_ZZ;
+		if (name == L"dV")           return SondeData::CURVE_DV_NOISE;
+		if (name == L"SNR")          return SondeData::CURVE_SNR;
+		if (name == L"BORDER ∠")     return SondeData::CURVE_BORDER_ANGLE;
+		if (name == L"INC")          return SondeData::CURVE_INC_ABS;
+		if (name == L"ω")            return SondeData::CURVE_ANGULAR_VELOCITY;
+		if (name == L"START SECTOR") return SondeData::CURVE_START_SECTOR;
+		if (name == L"DEPTH")        return SondeData::CURVE_DEPTH;
+
+		// Старые/полные имена (совместимость с сохранённой конфигурацией)
 		if (name->Contains(L"Разность фаз") || name->Contains(L"PH Z2-Z1") || name->Contains(L"Δφ"))
 			return SondeData::CURVE_PHASE_DIFF;
-		if (name->Contains(L"Амплитуда Rx1") || name->Contains(L"AM Z1") || name->Contains(L"Амплитуда Z1"))
+		if (name->Contains(L"Амплитуда Rx1") || name->Contains(L"AM Z1"))
 			return SondeData::CURVE_AMPLITUDE_RX1;
-		if (name->Contains(L"Амплитуда Rx2") || name->Contains(L"AM Z2") || name->Contains(L"Амплитуда Z2"))
+		if (name->Contains(L"Амплитуда Rx2") || name->Contains(L"AM Z2"))
 			return SondeData::CURVE_AMPLITUDE_RX2;
-		if (name->Contains(L"УЭС по фазе") || name->Contains(L"ρ_ph"))
+		if (name->Contains(L"УЭС по фазе") || name->Contains(L"ρ_ph") || name->Contains(L"УЭС_PH"))
 			return SondeData::CURVE_RHO_PHASE;
-		if (name->Contains(L"Затухание") || name->Contains(L"AM Z2/Z1") || name->Contains(L"Att"))
+		if (name->Contains(L"Затухание") || name->Contains(L"Att") || name->Contains(L"ATT_SMT"))
 			return SondeData::CURVE_ATTENUATION;
-		if (name->Contains(L"УЭС по затуханию") || name->Contains(L"ρ_att"))
+		if (name->Contains(L"УЭС по затуханию") || name->Contains(L"ρ_att") || name->Contains(L"УЭС_ATT"))
 			return SondeData::CURVE_RHO_ATT;
 		if (name->Contains(L"Симметризованная фаза") || name->Contains(L"PH_SMT"))
 			return SondeData::CURVE_PHASE_SMT;
-		if (name->Contains(L"Амплитуда нуля ZZ") || name->Contains(L"нуля ZZ"))
+		if (name->Contains(L"нуля ZZ") || name->Contains(L"Zero ZZ"))
 			return SondeData::CURVE_ZERO_AM_ZZ;
-		if (name->Contains(L"Температура RZZ") || name->Contains(L"Температура"))
+		if (name->Contains(L"нуля ZX") || name->Contains(L"Zero ZX"))
+			return SondeData::CURVE_ZERO_AM_ZX;
+		if (name->Contains(L"Погрешность"))
+			return SondeData::CURVE_ERROR_RHO;
+		if (name->Contains(L"Гео-Амплитуда") || name->Contains(L"AM_GEO"))
+			return SondeData::CURVE_GEO_AM;
+		if (name->Contains(L"Гео-Фаза") || name->Contains(L"PH_GEO"))
+			return SondeData::CURVE_GEO_PH;
+		if (name->Contains(L"V_ZX / V_ZZ") || name->Contains(L"PH_VZX"))
+			return SondeData::CURVE_RATIO_ZX_ZZ;
+		if (name->Contains(L"V_ZX"))
+			return SondeData::CURVE_V_ZX;
+		if (name->Contains(L"V_ZZ"))
+			return SondeData::CURVE_V_ZZ;
+		if (name->Contains(L"V_XX"))
+			return SondeData::CURVE_V_XX;
+		if (name->Contains(L"betta_z"))
+			return SondeData::CURVE_BETTA_Z;
+		if (name->Contains(L"dV"))
+			return SondeData::CURVE_DV_NOISE;
+		if (name->Contains(L"SNR"))
+			return SondeData::CURVE_SNR;
+		if (name->Contains(L"BORDER"))
+			return SondeData::CURVE_BORDER_ANGLE;
+		if (name->Contains(L"INC") || name->Contains(L"Инклинометр"))
+			return SondeData::CURVE_INC_ABS;
+		if (name->Contains(L"ANGULAR_VELOCITY") || name->Contains(L"Угловая") || name->Contains(L"Wg"))
+			return SondeData::CURVE_ANGULAR_VELOCITY;
+		if (name->Contains(L"SECTOR") || name->Contains(L"Сектор"))
+			return SondeData::CURVE_START_SECTOR;
+		if (name->Contains(L"Температура RZX"))
+			return SondeData::CURVE_TEMP_RZX;
+		if (name->Contains(L"Температура"))
 			return SondeData::CURVE_TEMPERATURE;
 		if (name->Contains(L"Кадр") || name->Contains(L"FRAME"))
 			return SondeData::CURVE_FRAME_NUM;
 		if (name->Contains(L"Акселерометр") || name->Contains(L"ACCEL"))
 			return SondeData::CURVE_ACCEL;
-
-		// Направленные
-		if (name->Contains(L"Гео-Амплитуда") || name->Contains(L"AM_GEO"))
-			return SondeData::CURVE_GEO_AM;
-		if (name->Contains(L"Гео-Фаза") || name->Contains(L"PH_GEO"))
-			return SondeData::CURVE_GEO_PH;
-		if (name->Contains(L"Напряжение V_ZX") || name->Contains(L"V_ZX"))
-			return SondeData::CURVE_V_ZX;
-		if (name->Contains(L"Напряжение V_ZZ") || name->Contains(L"V_ZZ"))
-			return SondeData::CURVE_V_ZZ;
-		if (name->Contains(L"Коэффициент betta_z") || name->Contains(L"betta_z"))
-			return SondeData::CURVE_BETTA_Z;
-		if (name->Contains(L"Отношение V_ZX / V_ZZ") || name->Contains(L"V_ZX / V_ZZ"))
-			return SondeData::CURVE_RATIO_ZX_ZZ;
-		if (name->Contains(L"Напряжение V_XX") || name->Contains(L"V_XX"))
-			return SondeData::CURVE_V_XX;
-		if (name->Contains(L"Шум dV") || name->Contains(L"dV"))
-			return SondeData::CURVE_DV_NOISE;
-		if (name->Contains(L"Сигнал/шум") || name->Contains(L"SNR"))
-			return SondeData::CURVE_SNR;
-		if (name->Contains(L"Амплитуда нуля ZX") || name->Contains(L"нуля ZX"))
-			return SondeData::CURVE_ZERO_AM_ZX;
-		if (name->Contains(L"Угол границы") || name->Contains(L"BORDER_ANGLE"))
-			return SondeData::CURVE_BORDER_ANGLE;
-		if (name->Contains(L"Инклинометр") || name->Contains(L"INC"))
-			return SondeData::CURVE_INC_ABS;
-		if (name->Contains(L"Угловая скорость") || name->Contains(L"ANGULAR_VELOCITY") || name->Contains(L"Wg"))
-			return SondeData::CURVE_ANGULAR_VELOCITY;
-		if (name->Contains(L"Стартовый сектор") || name->Contains(L"START_SECTOR"))
-			return SondeData::CURVE_START_SECTOR;
-		if (name->Contains(L"Температура RZX"))
-			return SondeData::CURVE_TEMP_RZX;
 		if (name->Contains(L"Глубина") || name->Contains(L"DEPTH"))
 			return SondeData::CURVE_DEPTH;
 
 		return SondeData::CURVE_PHASE_DIFF;
 	}
 
+	// Полное описание кривой — всплывающая подсказка при наведении на «чип»
+	static String^ GetCurveTooltip(String^ name)
+	{
+		int type = GetCurveTypeByName(name);
+		if (type >= SondeData::CURVE_PHASE_SMT_PC && type <= SondeData::CURVE_RHO_ATT_PC)
+		{
+			String^ units = type == SondeData::CURVE_PHASE_SMT_PC ? L"мгр" :
+				(type == SondeData::CURVE_ATT_SMT_PC ? L"дБ" : L"Ом·м");
+			return name + L" — расчёт на PC по исходным данным и метрологии, " + units;
+		}
+		if (name->EndsWith(L" Sonde"))
+			return L"Sonde — готовое поле кадра прибора. " + GetCurveTooltip(name->Substring(0, name->Length - 6));
+		if (name == L"Raw Δφ")        return L"PH Z2-Z1 — разность фаз приёмников (DELTA_PH), мгр";
+		if (name == L"AM Z2/Z1")     return L"Затухание 20·log10(AM Z2/AM Z1), знак чередуется по Tx, дБ";
+		if (name == L"AMP Z1")       return L"AM Z1 — амплитуда приёмника Z1, мВ";
+		if (name == L"AMP Z2")       return L"AM Z2 — амплитуда приёмника Z2, мВ";
+		if (name == L"AM silent")    return L"AM Zero ZZ — «тихая» амплитуда без генератора, мкВ";
+		if (name == L"TEMP")         return L"Temp RZZ — температура, °C";
+		if (name == L"Δφ SMT")        return L"PH_SMT_from_sonde — симметризованная фаза прибора, мгр";
+		if (name == L"RO Δφ")         return L"УЭС по фазе (rho_ph_smt), Ом·м";
+		if (name == L"ATT SMT")      return L"ATT_SMT_from_sonde — симметризованное затухание прибора, дБ";
+		if (name == L"RO ATT")       return L"УЭС по затуханию (rho_att_smt), Ом·м";
+		if (name == L"ε RO")         return L"Погрешность УЭС — невязка прибор/компьютер (PC-пересчёт, след. этап)";
+		if (name == L"FRAME")        return L"FRAME — номер кадра прибора";
+		if (name == L"ACCEL")        return L"ACCEL — акселерометр";
+		if (name == L"AM GEO")       return L"AM_GEO — амплитуда геосигнала (|Geo|)";
+		if (name == L"Δφ GEO")        return L"PH_GEO — фаза геосигнала (arg Geo), мгр";
+		if (name == L"AM GEO SMT")   return L"AM_GEO_SMT — сглаженная гео-амплитуда, дБ";
+		if (name == L"Δφ GEO SMT")    return L"PH_GEO_SMT — сглаженная гео-фаза, град";
+		if (name == L"AM VZX")       return L"AM_V_ZX — амплитуда направленного приёмника, мВ";
+		if (name == L"AM VZZ")       return L"AM_V_ZZ — амплитуда осевого приёмника, мВ";
+		if (name == L"AM VXX")       return L"AM_V_XX — амплитуда поперечного приёмника, мВ";
+		if (name == L"βz")           return L"betta_z — электрический угол наклона антенны";
+		if (name == L"Δφ VZX/VZZ")    return L"PH_VZX / VZZ — разность фаз VZX и VZZ, мгр";
+		if (name == L"dV")           return L"dV — разброс по 16 секторам (шум)";
+		if (name == L"SNR")          return L"SNR — отношение сигнал/шум";
+		if (name == L"AM silent ZX") return L"AM Zero ZX — «тихая» амплитуда направленного приёмника, мкВ";
+		if (name == L"BORDER ∠")     return L"BORDER_ANGLE — угол границы пласта, град";
+		if (name == L"INC")          return L"INC — инклинометр: Abs / Zen / Azm, град";
+		if (name == L"ω")            return L"ANGULAR_VELOCITY — угловая скорость вращения";
+		if (name == L"START SECTOR") return L"START_SECTOR — стартовый сектор кадра";
+		if (name == L"TEMP RZX")     return L"Temp RZX — температура направленного приёмника, °C";
+		if (name == L"DEPTH")        return L"DEPTH — глубина, м";
+		return name;
+	}
+
+	static void AddCurvePoint(Series^ series, double x, double y)
+	{
+		bool missing = Double::IsNaN(y) || Double::IsInfinity(y);
+		int index = series->Points->AddXY(x, missing ? 0.0 : y);
+		series->Points[index]->IsEmpty = missing;
+	}
+
 	static String^ GetAxisTitleByCurve(String^ name)
 	{
-		if (String::IsNullOrEmpty(name)) return L"Фаза Δφ (град)";
-		if (name->Contains(L"Разность фаз") || name->Contains(L"PH Z2-Z1") || name->Contains(L"Δφ") || name->Contains(L"PH_SMT") || name->Contains(L"Гео-Фаза"))
-			return L"Фаза (град)";
-		if (name->Contains(L"Амплитуда нуля") || name->Contains(L"Напряжение") || name->Contains(L"V_ZX") || name->Contains(L"V_ZZ") || name->Contains(L"V_XX") || name->Contains(L"Шум dV"))
-			return L"Напряжение (мВ)";
-		if (name->Contains(L"Амплитуда") || name->Contains(L"AM Z"))
-			return L"Амплитуда (мВ)";
-		if (name->Contains(L"УЭС") || name->Contains(L"ρ"))
-			return L"УЭС (Ом·м)";
-		if (name->Contains(L"Затухание") || name->Contains(L"Att") || name->Contains(L"Гео-Амплитуда"))
-			return L"Затухание (дБ)";
-		if (name->Contains(L"Температура"))
-			return L"Температура (°C)";
-		if (name->Contains(L"Угол границы"))
+		int type = GetCurveTypeByName(name);
+		if (type >= SondeData::CURVE_PHASE_SMT_PC && type <= SondeData::CURVE_RHO_ATT_PC && !SondeData::HasMetrology())
+			return L"PC: загрузите метрологию — расчёт недоступен";
+		switch (GetCurveTypeByName(name))
+		{
+		case SondeData::CURVE_PHASE_DIFF:
+		case SondeData::CURVE_PHASE_SMT_PC:
+		case SondeData::CURVE_PHASE_SMT:
+		case SondeData::CURVE_GEO_PH:
+		case SondeData::CURVE_RATIO_ZX_ZZ:
+			return L"Фаза (мгр)";
+		case SondeData::CURVE_GEO_PH_SMT:
+		case SondeData::CURVE_BORDER_ANGLE:
+		case SondeData::CURVE_INC_ABS:
 			return L"Угол (град)";
-		if (name->Contains(L"Инклинометр"))
-			return L"Углы инклинометра (град)";
-		if (name->Contains(L"Угловая скорость"))
+		case SondeData::CURVE_AMPLITUDE_RX1:
+		case SondeData::CURVE_AMPLITUDE_RX2:
+		case SondeData::CURVE_GEO_AM:
+		case SondeData::CURVE_V_ZX:
+		case SondeData::CURVE_V_ZZ:
+		case SondeData::CURVE_V_XX:
+		case SondeData::CURVE_DV_NOISE:
+			return L"Амплитуда (мВ)";
+		case SondeData::CURVE_ZERO_AM_ZZ:
+		case SondeData::CURVE_ZERO_AM_ZX:
+			return L"Амплитуда (мкВ)";
+		case SondeData::CURVE_RHO_PHASE_PC:
+		case SondeData::CURVE_RHO_ATT_PC:
+		case SondeData::CURVE_RHO_PHASE:
+		case SondeData::CURVE_RHO_ATT:
+		case SondeData::CURVE_ERROR_RHO:
+			return L"УЭС (Ом·м)";
+		case SondeData::CURVE_ATTENUATION:
+		case SondeData::CURVE_ATT_SMT_PC:
+		case SondeData::CURVE_ATT_SMT:
+		case SondeData::CURVE_GEO_AM_SMT:
+			return L"Затухание (дБ)";
+		case SondeData::CURVE_TEMPERATURE:
+		case SondeData::CURVE_TEMP_RZX:
+			return L"Температура (°C)";
+		case SondeData::CURVE_ANGULAR_VELOCITY:
 			return L"Скорость (об/мин)";
-		if (name->Contains(L"Глубина"))
+		case SondeData::CURVE_START_SECTOR:
+			return L"Сектор";
+		case SondeData::CURVE_DEPTH:
 			return L"Глубина (м)";
-		if (name->Contains(L"Кадр"))
+		case SondeData::CURVE_FRAME_NUM:
 			return L"Номер кадра";
-		if (name->Contains(L"betta_z") || name->Contains(L"Отношение") || name->Contains(L"SNR"))
+		case SondeData::CURVE_BETTA_Z:
+		case SondeData::CURVE_SNR:
 			return L"Отношение";
+		}
 		return L"Значение";
 	}
 
@@ -437,9 +637,25 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		if (precisionMode <= 0) // Авто
 		{
 			if (String::IsNullOrEmpty(curveName)) return L"F2";
-			if (curveName->Contains(L"Температура")) return L"F1";
-			if (curveName->Contains(L"Кадр") || curveName->Contains(L"FRAME") || curveName->Contains(L"Глубина") || curveName->Contains(L"Сектор")) return L"F0";
-			if (curveName->Contains(L"Напряжение") || curveName->Contains(L"нуля") || curveName->Contains(L"V_") || curveName->Contains(L"dV") || curveName->Contains(L"AM Z")) return L"F4";
+			switch (GetCurveTypeByName(curveName))
+			{
+			case SondeData::CURVE_TEMPERATURE:
+			case SondeData::CURVE_TEMP_RZX:
+				return L"F1";
+			case SondeData::CURVE_FRAME_NUM:
+			case SondeData::CURVE_START_SECTOR:
+			case SondeData::CURVE_DEPTH:
+				return L"F0";
+			case SondeData::CURVE_AMPLITUDE_RX1:
+			case SondeData::CURVE_AMPLITUDE_RX2:
+			case SondeData::CURVE_ZERO_AM_ZZ:
+			case SondeData::CURVE_ZERO_AM_ZX:
+			case SondeData::CURVE_V_ZX:
+			case SondeData::CURVE_V_ZZ:
+			case SondeData::CURVE_V_XX:
+			case SondeData::CURVE_DV_NOISE:
+				return L"F4";
+			}
 			return L"F2";
 		}
 		return L"F" + (precisionMode - 1);
@@ -453,17 +669,21 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		bool hasTx5 = (txCount >= 5);
 		bool hasTx4 = (txCount >= 4);
 
+		// Смена конфигурации прибора — по умолчанию все передатчики видимы;
+		// внутри одной сессии ручные снятия галочек не трогаем
+		if (txCount != this->lastShownTxCount)
+		{
+			this->checkTx1_5->Checked = hasTx5;
+			this->checkTx2_5->Checked = hasTx5;
+			this->checkTx1_4->Checked = hasTx4;
+			this->checkTx2_4->Checked = hasTx4;
+			this->lastShownTxCount = txCount;
+		}
+
 		this->checkTx1_5->Visible = hasTx5;
-		if (!hasTx5) this->checkTx1_5->Checked = false;
-
 		this->checkTx2_5->Visible = hasTx5;
-		if (!hasTx5) this->checkTx2_5->Checked = false;
-
 		this->checkTx1_4->Visible = hasTx4;
-		if (!hasTx4) this->checkTx1_4->Checked = false;
-
 		this->checkTx2_4->Visible = hasTx4;
-		if (!hasTx4) this->checkTx2_4->Checked = false;
 
 		if (this->chartTime1->Series->Count >= 5)
 		{
@@ -499,129 +719,94 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 	void MainForm::RenderLoadedCurves()
 	{
-		if (!SondeData::IsLoaded()) return;
+		RenderChart(1);
+		RenderChart(2);
+	}
 
+	void MainForm::RenderChart(int windowIndex)
+	{
+		if (!SondeData::IsLoaded()) return;
 		size_t frameCount = SondeData::GetFrameCount();
 		if (frameCount == 0) return;
-
 		UpdateTxControlsVisibility();
-
+		UpdateChartPalette(windowIndex);
+		Chart^ chart = windowIndex == 1 ? this->chartTime1 : this->chartTime2;
+		ChartArea^ area = chart->ChartAreas[0];
+		bool temperature = !this->isStreaming && (windowIndex == 1 ? this->isTempXAxis1 : this->isTempXAxis2);
+		String^ active = windowIndex == 1 ? this->activeCurve1 : this->activeCurve2;
+		int frequency = (windowIndex == 1 ? this->buttonFreq1 : this->buttonFreq2)->Text->Contains(L"2000") ? 1 : 0;
+		int receiver = windowIndex == 1 ? this->receiverIndex1 : this->receiverIndex2;
+		int precision = windowIndex == 1 ? this->precisionY1 : this->precisionY2;
 		int txCount = SondeData::GetTxCount();
-		int freq1 = (this->buttonFreq1->Text->Contains(L"2000")) ? 1 : 0;
-		int freq2 = (this->buttonFreq2->Text->Contains(L"2000")) ? 1 : 0;
-
-		this->chartTime1->ChartAreas[0]->AxisX->Title = this->isTempXAxis1 ? L"Температура (°C)" : L"Кадр (N)";
-		this->chartTime2->ChartAreas[0]->AxisX->Title = this->isTempXAxis2 ? L"Температура (°C)" : L"Кадр (N)";
-		this->chartTime1->ChartAreas[0]->AxisX->LabelStyle->Format = L"F0";
-		this->chartTime2->ChartAreas[0]->AxisX->LabelStyle->Format = L"F0";
-		this->chartTime1->ChartAreas[0]->AxisX->Interval = 0;
-		this->chartTime2->ChartAreas[0]->AxisX->Interval = 0;
-		this->chartTime1->ChartAreas[0]->AxisX->IntervalAutoMode = IntervalAutoMode::VariableCount;
-		this->chartTime2->ChartAreas[0]->AxisX->IntervalAutoMode = IntervalAutoMode::VariableCount;
-
-		this->chartTime1->ChartAreas[0]->AxisY->Title = GetAxisTitleByCurve(this->activeCurve1);
-		this->chartTime2->ChartAreas[0]->AxisY->Title = GetAxisTitleByCurve(this->activeCurve2);
-
-		String^ fmt1 = GetPrecisionFormat(this->precisionY1, this->activeCurve1);
-		String^ fmt2 = GetPrecisionFormat(this->precisionY2, this->activeCurve2);
-		this->chartTime1->ChartAreas[0]->AxisY->LabelStyle->Format = fmt1;
-		this->chartTime2->ChartAreas[0]->AxisY->LabelStyle->Format = fmt2;
-
-		int curveType1 = GetCurveTypeByName(this->activeCurve1);
-		int curveType2 = GetCurveTypeByName(this->activeCurve2);
+		int curveType = GetCurveTypeByName(active);
+		area->AxisX->Title = temperature ? L"Температура (°C)" : L"Кадр (N)";
+		area->AxisX->LabelStyle->Format = L"F0";
+		area->AxisX->Interval = 0;
+		area->AxisX->IntervalAutoMode = IntervalAutoMode::VariableCount;
+		area->AxisY->Title = GetAxisTitleByCurve(active);
+		area->AxisY->LabelStyle->Format = GetPrecisionFormat(precision, active);
 
 		// Запоминаем текущий зум, если включен чекбокс удержания
-		bool hold1 = this->checkHoldZoom1->Checked && this->chartTime1->ChartAreas[0]->AxisX->ScaleView->IsZoomed;
-		double vMin1 = this->chartTime1->ChartAreas[0]->AxisX->ScaleView->ViewMinimum;
-		double vMax1 = this->chartTime1->ChartAreas[0]->AxisX->ScaleView->ViewMaximum;
-
-		bool hold2 = this->checkHoldZoom2->Checked && this->chartTime2->ChartAreas[0]->AxisX->ScaleView->IsZoomed;
-		double vMin2 = this->chartTime2->ChartAreas[0]->AxisX->ScaleView->ViewMinimum;
-		double vMax2 = this->chartTime2->ChartAreas[0]->AxisX->ScaleView->ViewMaximum;
-
-		for (int s = 0; s < this->chartTime1->Series->Count; s++)
-			this->chartTime1->Series[s]->Points->Clear();
-		for (int s = 0; s < this->chartTime2->Series->Count; s++)
-			this->chartTime2->Series[s]->Points->Clear();
-
-		size_t start1 = 0;
-		size_t end1 = frameCount - 1;
-		if (this->minFrame1 >= 0 && static_cast<size_t>(this->minFrame1) < frameCount)
-			start1 = static_cast<size_t>(this->minFrame1);
-		if (this->maxFrame1 > 0 && static_cast<size_t>(this->maxFrame1) < frameCount)
-			end1 = static_cast<size_t>(this->maxFrame1);
-		if (start1 > end1) { size_t tmp = start1; start1 = end1; end1 = tmp; }
-
-		size_t start2 = 0;
-		size_t end2 = frameCount - 1;
-		if (this->minFrame2 >= 0 && static_cast<size_t>(this->minFrame2) < frameCount)
-			start2 = static_cast<size_t>(this->minFrame2);
-		if (this->maxFrame2 > 0 && static_cast<size_t>(this->maxFrame2) < frameCount)
-			end2 = static_cast<size_t>(this->maxFrame2);
-		if (start2 > end2) { size_t tmp = start2; start2 = end2; end2 = tmp; }
-
-		for (size_t i = start1; i <= end1 && i < frameCount; ++i)
+		bool hold = (windowIndex == 1 ? this->checkHoldZoom1 : this->checkHoldZoom2)->Checked;
+		if (!hold)
 		{
-			double xVal1 = this->isTempXAxis1 ? SondeData::GetTemperature(i) : static_cast<double>(i);
-			for (int tx = 0; tx < txCount && tx < this->chartTime1->Series->Count; ++tx)
-			{
-				double yVal = SondeData::GetCurveValue(curveType1, freq1, tx, i);
-				this->chartTime1->Series[tx]->Points->AddXY(xVal1, yVal);
-			}
+			area->AxisX->ScaleView->ZoomReset(0);
+			area->AxisY->ScaleView->ZoomReset(0);
+			area->AxisX->Minimum = Double::NaN;
+			area->AxisX->Maximum = Double::NaN;
+			area->AxisY->Minimum = Double::NaN;
+			area->AxisY->Maximum = Double::NaN;
+			area->AxisY->Interval = 0;
 		}
-
-		for (size_t i = start2; i <= end2 && i < frameCount; ++i)
+		for each (Series^ series in chart->Series) series->Points->Clear();
+		if (String::IsNullOrEmpty(active))
 		{
-			double xVal2 = this->isTempXAxis2 ? SondeData::GetTemperature(i) : static_cast<double>(i);
-			for (int tx = 0; tx < txCount && tx < this->chartTime2->Series->Count; ++tx)
-			{
-				double yVal = SondeData::GetCurveValue(curveType2, freq2, tx, i);
-				this->chartTime2->Series[tx]->Points->AddXY(xVal2, yVal);
-			}
+			area->RecalculateAxesScale();
+			chart->Invalidate();
+			return;
+		}
+		size_t start = 0, end = frameCount - 1;
+		int minimum = windowIndex == 1 ? this->minFrame1 : this->minFrame2;
+		int maximum = windowIndex == 1 ? this->maxFrame1 : this->maxFrame2;
+		if (minimum >= 0 && static_cast<size_t>(minimum) < frameCount) start = minimum;
+		if (maximum >= 0 && static_cast<size_t>(maximum) < frameCount) end = maximum;
+		if (start > end) std::swap(start, end);
+		if (this->isStreaming)
+		{
+			size_t points = static_cast<size_t>(Math::Max(1, (int)AppConfig::Instance().points));
+			start = frameCount > points ? frameCount - points : 0;
+			end = frameCount - 1;
+			if (windowIndex == 1) { this->minFrame1 = (int)start; this->maxFrame1 = (int)end; }
+			else { this->minFrame2 = (int)start; this->maxFrame2 = (int)end; }
+			(windowIndex == 1 ? this->textBoxMin1 : this->textBoxMin2)->Text = start.ToString();
+			(windowIndex == 1 ? this->textBoxMax1 : this->textBoxMax2)->Text = end.ToString();
+			area->AxisX->ScaleView->ZoomReset(0);
+			area->AxisX->Minimum = (double)start;
+			area->AxisX->Maximum = Math::Max((double)start + 1, (double)end);
+		}
+		for (size_t i = start; i <= end; ++i)
+		{
+			double x = temperature ? SondeData::GetTemperature(i) : static_cast<double>(i);
+			for (int tx = 0; tx < txCount && tx < chart->Series->Count; ++tx)
+				AddCurvePoint(chart->Series[tx], x, SondeData::GetCurveValue(curveType, frequency, tx, i, receiver));
 		}
 
 		// Применяем фильтры передатчиков с учетом типа зонда
-		if (this->chartTime1->Series->Count >= 1) this->chartTime1->Series[0]->Enabled = this->checkTx1_1->Checked;
-		if (this->chartTime1->Series->Count >= 2) this->chartTime1->Series[1]->Enabled = this->checkTx1_2->Checked;
-		if (this->chartTime1->Series->Count >= 3) this->chartTime1->Series[2]->Enabled = this->checkTx1_3->Checked;
-		if (this->chartTime1->Series->Count >= 4) this->chartTime1->Series[3]->Enabled = (txCount >= 4 && this->checkTx1_4->Checked);
-		if (this->chartTime1->Series->Count >= 5) this->chartTime1->Series[4]->Enabled = (txCount >= 5 && this->checkTx1_5->Checked);
+		cli::array<CheckBox^>^ checks = windowIndex == 1 ?
+			gcnew cli::array<CheckBox^> { this->checkTx1_1, this->checkTx1_2, this->checkTx1_3, this->checkTx1_4, this->checkTx1_5 } :
+			gcnew cli::array<CheckBox^> { this->checkTx2_1, this->checkTx2_2, this->checkTx2_3, this->checkTx2_4, this->checkTx2_5 };
+		for (int tx = 0; tx < chart->Series->Count && tx < checks->Length; ++tx)
+			chart->Series[tx]->Enabled = tx < txCount && checks[tx]->Checked;
+		area->RecalculateAxesScale();
+		chart->Invalidate();
+	}
 
-		if (this->chartTime2->Series->Count >= 1) this->chartTime2->Series[0]->Enabled = this->checkTx2_1->Checked;
-		if (this->chartTime2->Series->Count >= 2) this->chartTime2->Series[1]->Enabled = this->checkTx2_2->Checked;
-		if (this->chartTime2->Series->Count >= 3) this->chartTime2->Series[2]->Enabled = this->checkTx2_3->Checked;
-		if (this->chartTime2->Series->Count >= 4) this->chartTime2->Series[3]->Enabled = (txCount >= 4 && this->checkTx2_4->Checked);
-		if (this->chartTime2->Series->Count >= 5) this->chartTime2->Series[4]->Enabled = (txCount >= 5 && this->checkTx2_5->Checked);
-
-		this->chartTime1->ChartAreas[0]->AxisY->Minimum = Double::NaN;
-		this->chartTime1->ChartAreas[0]->AxisY->Maximum = Double::NaN;
-		this->chartTime2->ChartAreas[0]->AxisY->Minimum = Double::NaN;
-		this->chartTime2->ChartAreas[0]->AxisY->Maximum = Double::NaN;
-
-		if (hold1 && !Double::IsNaN(vMin1) && !Double::IsNaN(vMax1) && vMax1 > vMin1)
-		{
-			this->chartTime1->ChartAreas[0]->AxisX->ScaleView->Zoom(vMin1, vMax1);
-		}
-		else
-		{
-			this->chartTime1->ChartAreas[0]->AxisX->Minimum = Double::NaN;
-			this->chartTime1->ChartAreas[0]->AxisX->Maximum = Double::NaN;
-			this->chartTime1->ChartAreas[0]->AxisX->ScaleView->ZoomReset(0);
-		}
-
-		if (hold2 && !Double::IsNaN(vMin2) && !Double::IsNaN(vMax2) && vMax2 > vMin2)
-		{
-			this->chartTime2->ChartAreas[0]->AxisX->ScaleView->Zoom(vMin2, vMax2);
-		}
-		else
-		{
-			this->chartTime2->ChartAreas[0]->AxisX->Minimum = Double::NaN;
-			this->chartTime2->ChartAreas[0]->AxisX->Maximum = Double::NaN;
-			this->chartTime2->ChartAreas[0]->AxisX->ScaleView->ZoomReset(0);
-		}
-
-		this->chartTime1->Invalidate();
-		this->chartTime2->Invalidate();
+	void MainForm::RefreshChart(int windowIndex)
+	{
+		UpdateChartHeaderControls();
+		SetActiveSchemeChart(windowIndex - 1);
+		RenderChart(windowIndex);
+		SaveStationConfig();
 	}
 
 	void MainForm::UpdateTimeSlices(double timeVal)
@@ -900,6 +1085,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		chart->Invalidate();
 	}
 
+	static cli::array<String^>^ GetCurvePool(bool direct);
+
 	void MainForm::PopulateCurveMenu(int windowIndex)
 	{
 		System::Windows::Forms::ContextMenuStrip^ curveMenu = (windowIndex == 1) ? this->contextMenuCurves1 : this->contextMenuCurves2;
@@ -908,46 +1095,14 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 		curveMenu->Items->Clear();
 
-		cli::array<String^>^ poolUndirect = gcnew cli::array<String^> {
-			L"Фаза Δφ (PH Z2-Z1)",
-			L"Затухание Att (AM Z2/Z1)",
-			L"УЭС по фазе (ρ_ph)",
-			L"УЭС по затуханию (ρ_att)",
-			L"Амплитуда Z1 (AM Z1)",
-			L"Амплитуда Z2 (AM Z2)",
-			L"Амплитуда нуля ZZ",
-			L"Температура RZZ",
-			L"Погрешность УЭС",
-			L"Кадр (FRAME)",
-			L"Акселерометр (ACCEL)"
-		};
-
-		cli::array<String^>^ poolDirect = gcnew cli::array<String^> {
-			L"Гео-Амплитуда (AM_GEO)",
-			L"Гео-Фаза (PH_GEO)",
-			L"Напряжение V_ZX",
-			L"Напряжение V_ZZ",
-			L"Коэффициент betta_z",
-			L"Отношение V_ZX / V_ZZ",
-			L"Напряжение V_XX",
-			L"Шум dV (мусор)",
-			L"Сигнал/шум (SNR)",
-			L"Амплитуда нуля ZX",
-			L"Угол границы (BORDER_ANGLE)",
-			L"Инклинометр (INC Abs/Zen/Azm)",
-			L"Угловая скорость (ANGULAR_VELOCITY)",
-			L"Стартовый сектор (START_SECTOR)",
-			L"Температура RZX",
-			L"Глубина (DEPTH)"
-		};
-
-		cli::array<String^>^ activePool = isDirect ? poolDirect : poolUndirect;
+		cli::array<String^>^ activePool = GetCurvePool(isDirect);
 
 		for each (String^ curve in activePool)
 		{
 			if (!pinned->Contains(curve))
 			{
 				ToolStripMenuItem^ item = gcnew ToolStripMenuItem(curve);
+				item->ToolTipText = GetCurveTooltip(curve);
 				item->Tag = windowIndex;
 				item->Click += gcnew EventHandler(this, &MainForm::CurveMenuItem_Click);
 				curveMenu->Items->Add(item);
@@ -962,8 +1117,78 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		}
 	}
 
+	static String^ NormalizeCurveName(String^ curveName)
+	{
+		switch (GetCurveTypeByName(curveName))
+		{
+		case SondeData::CURVE_PHASE_SMT: return L"Δφ SMT Sonde";
+		case SondeData::CURVE_RHO_PHASE: return L"RO Δφ Sonde";
+		case SondeData::CURVE_ATT_SMT: return L"ATT SMT Sonde";
+		case SondeData::CURVE_RHO_ATT: return L"RO ATT Sonde";
+		case SondeData::CURVE_PHASE_SMT_PC: return L"Δφ SMT PC";
+		case SondeData::CURVE_RHO_PHASE_PC: return L"RO Δφ PC";
+		case SondeData::CURVE_ATT_SMT_PC: return L"ATT SMT PC";
+		case SondeData::CURVE_RHO_ATT_PC: return L"RO ATT PC";
+		}
+		return curveName;
+	}
+
+	static cli::array<String^>^ GetCurvePool(bool direct)
+	{
+		if (direct) return gcnew cli::array<String^> {
+			L"AM GEO",      // AM_GEO — амплитуда геосигнала
+			L"Δφ GEO",       // PH_GEO — фаза геосигнала
+			L"AM VZX",      // AM_V_ZX
+			L"AM VZZ",      // AM_V_ZZ
+			L"βz",          // betta_z
+			L"Δφ VZX/VZZ",   // PH_VZX / VZZ
+			L"AM VXX",      // AM_V_XX
+			L"dV",          // шум dV
+			L"SNR",         // сигнал/шум
+			L"AM silent ZX",// AM Zero ZX
+			L"AM GEO SMT",  // сглаженная гео-амплитуда (ATT_dB_geo_signal_smt)
+			L"Δφ GEO SMT",   // сглаженная гео-фаза (PH_deg_geo_signal_smt)
+			L"BORDER ∠",    // угол границы
+			L"INC",         // инклинометр Abs/Zen/Azm
+			L"ω",           // ANGULAR_VELOCITY — угловая скорость
+			L"START SECTOR",// стартовый сектор
+			L"TEMP RZX",    // температура RZX
+			L"FRAME",
+			L"DEPTH"
+		};
+		return gcnew cli::array<String^> {
+			L"Raw Δφ",       // PH Z2-Z1 — разность фаз Z2-Z1 (DELTA_PH)
+			L"AM Z2/Z1",    // затухание, вычисленное из амплитуд
+			L"AMP Z1",      // амплитуда приёмника Z1
+			L"AMP Z2",      // амплитуда приёмника Z2
+			L"AM silent",   // AM Zero ZZ — «тихая» амплитуда
+			L"TEMP",        // Temp RZZ
+			L"Δφ SMT PC",
+			L"RO Δφ PC",
+			L"Δφ SMT Sonde",       // PH_SMT_from_sonde — симметризованная фаза прибора
+			L"RO Δφ Sonde",        // УЭС по фазе (rho_ph_smt)
+			L"ATT SMT PC",
+			L"RO ATT PC",
+			L"ATT SMT Sonde",     // ATT_SMT_from_sonde — симметризованное затухание прибора
+			L"RO ATT Sonde",      // УЭС по затуханию (rho_att_smt)
+			L"ε RO",        // Погрешность УЭС (PC-пересчёт — следующий этап)
+			L"FRAME",       // номер кадра
+			L"ACCEL"        // акселерометр
+		};
+	}
+
+	static bool IsCurveValidForMode(String^ curveName, bool direct)
+	{
+		if (String::IsNullOrEmpty(curveName)) return false;
+		curveName = NormalizeCurveName(curveName);
+		for each (String^ candidate in GetCurvePool(direct))
+			if (candidate == curveName) return true;
+		return false;
+	}
+
 	void MainForm::AddCurveChip(int windowIndex, String^ curveName)
 	{
+		curveName = NormalizeCurveName(curveName);
 		List<String^>^ pinned = (windowIndex == 1) ? this->pinnedCurves1 : this->pinnedCurves2;
 		FlowLayoutPanel^ panel = (windowIndex == 1) ? this->flowPanelChips1 : this->flowPanelChips2;
 
@@ -1003,6 +1228,11 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		chip->Click += gcnew EventHandler(this, &MainForm::Chip_Click);
 		lbl->Click += gcnew EventHandler(this, &MainForm::Chip_Click);
 
+		// Всплывающая подсказка — полное имя кривой (как в старой программе)
+		String^ hint = GetCurveTooltip(curveName);
+		this->toolTipMain->SetToolTip(chip, hint);
+		this->toolTipMain->SetToolTip(lbl, hint);
+
 		panel->Controls->Add(chip);
 
 		if (windowIndex == 1 && String::IsNullOrEmpty(this->activeCurve1))
@@ -1032,8 +1262,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->activeCurve2 = curveName;
 
 		UpdateChipStyles(wIdx);
-		RenderLoadedCurves();
-		SaveStationConfig();
+		RefreshChart(wIdx);
 	}
 
 	void MainForm::UpdateChipStyles(int windowIndex)
@@ -1085,6 +1314,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		List<String^>^ pinned = (windowIndex == 1) ? this->pinnedCurves1 : this->pinnedCurves2;
 		FlowLayoutPanel^ panel = (windowIndex == 1) ? this->flowPanelChips1 : this->flowPanelChips2;
 
+		int removedIndex = pinned->IndexOf(curveName);
 		pinned->Remove(curveName);
 
 		Control^ toRemove = nullptr;
@@ -1102,18 +1332,19 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			delete toRemove;
 		}
 
+		// После закрытия активной кривой активной становится предыдущая в списке,
+		// либо первая оставшаяся; если кривых не осталось — график пустой
 		if (windowIndex == 1 && this->activeCurve1 == curveName)
 		{
-			this->activeCurve1 = (this->pinnedCurves1->Count > 0) ? this->pinnedCurves1[0] : "";
+			this->activeCurve1 = (pinned->Count > 0) ? pinned[removedIndex > 0 ? removedIndex - 1 : 0] : String::Empty;
 		}
 		else if (windowIndex == 2 && this->activeCurve2 == curveName)
 		{
-			this->activeCurve2 = (this->pinnedCurves2->Count > 0) ? this->pinnedCurves2[0] : "";
+			this->activeCurve2 = (pinned->Count > 0) ? pinned[removedIndex > 0 ? removedIndex - 1 : 0] : String::Empty;
 		}
 
 		UpdateChipStyles(windowIndex);
-		RenderLoadedCurves();
-		SaveStationConfig();
+		RefreshChart(windowIndex);
 	}
 
 	System::Void MainForm::CurveMenuItem_Click(System::Object^ sender, System::EventArgs^ e)
@@ -1126,8 +1357,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			if (wIdx == 1) this->activeCurve1 = item->Text;
 			else this->activeCurve2 = item->Text;
 			UpdateChipStyles(wIdx);
-			RenderLoadedCurves();
-			SaveStationConfig();
+			RefreshChart(wIdx);
 		}
 	}
 
@@ -1143,59 +1373,185 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		this->contextMenuCurves2->Show(this->buttonAddCurve2, Point(0, this->buttonAddCurve2->Height));
 	}
 
-	System::Void MainForm::buttonMode1_Click(System::Object^ sender, System::EventArgs^ e)
+	void MainForm::RememberChartMode(int windowIndex)
 	{
-		this->isDirectMode1 = !this->isDirectMode1;
-		this->buttonMode1->Text = this->isDirectMode1 ? L"DIRECT" : L"UNDIRECT";
-		this->buttonMode1->BackColor = this->isDirectMode1 ? Color::FromArgb(255, 240, 210) : Color::FromArgb(220, 245, 225);
+		if (this->modePinnedCurves == nullptr) return;
+		bool direct = windowIndex == 1 ? this->isDirectMode1 : this->isDirectMode2;
+		int index = (windowIndex - 1) * 2 + (direct ? 1 : 0);
+		this->modePinnedCurves[index] = gcnew List<String^>(windowIndex == 1 ? this->pinnedCurves1 : this->pinnedCurves2);
+		this->modeActiveCurves[index] = windowIndex == 1 ? this->activeCurve1 : this->activeCurve2;
+	}
 
-		this->flowPanelChips1->Controls->Clear();
-		this->pinnedCurves1->Clear();
-
-		if (this->isDirectMode1)
+	void MainForm::AppendModeConfig(System::Text::StringBuilder^ builder, int windowIndex)
+	{
+		for (int mode = 0; mode < 2; ++mode)
 		{
-			AddCurveChip(1, L"Гео-Амплитуда (AM_GEO)");
-			AddCurveChip(1, L"Гео-Фаза (PH_GEO)");
-			this->activeCurve1 = L"Гео-Фаза (PH_GEO)";
+			int index = (windowIndex - 1) * 2 + mode;
+			if (this->modeActiveCurves[index] == nullptr) continue;
+			String^ prefix = mode == 0 ? L"Undirect" : L"Direct";
+			builder->AppendLine(String::Format(L"    \"{0}ActiveCurve\": \"{1}\",", prefix, this->modeActiveCurves[index]));
+			builder->Append(String::Format(L"    \"{0}PinnedCurves\": [", prefix));
+			List<String^>^ pinned = this->modePinnedCurves[index];
+			for (int i = 0; i < pinned->Count; ++i)
+				builder->Append(String::Format(L"\"{0}\"{1}", pinned[i], i + 1 < pinned->Count ? L", " : L""));
+			builder->AppendLine(L"],");
+		}
+	}
+
+	bool MainForm::LoadModeConfigLine(int windowIndex, String^ line)
+	{
+		for (int mode = 0; mode < 2; ++mode)
+		{
+			int index = (windowIndex - 1) * 2 + mode;
+			String^ prefix = mode == 0 ? L"Undirect" : L"Direct";
+			if (line->StartsWith(L"\"" + prefix + L"ActiveCurve\":"))
+			{
+				String^ name = NormalizeCurveName(line->Substring(line->IndexOf(':') + 1)->Trim()->Trim(',')->Trim('"'));
+				// Кривая чужого режима из повреждённой конфигурации отбрасывается
+				this->modeActiveCurves[index] = IsCurveValidForMode(name, mode == 1) ? name : nullptr;
+				return true;
+			}
+			if (line->StartsWith(L"\"" + prefix + L"PinnedCurves\":"))
+			{
+				int start = line->IndexOf('['), end = line->LastIndexOf(']');
+				this->modePinnedCurves[index]->Clear();
+				if (start >= 0 && end > start)
+					for each (String^ item in line->Substring(start + 1, end - start - 1)->Split(','))
+					{
+						String^ curve = NormalizeCurveName(item->Trim()->Trim('"'));
+						if (IsCurveValidForMode(curve, mode == 1)) this->modePinnedCurves[index]->Add(curve);
+					}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void MainForm::SetChartMode(int windowIndex, bool direct)
+	{
+		if ((windowIndex == 1 ? this->isDirectMode1 : this->isDirectMode2) == direct) return;
+		RememberChartMode(windowIndex);
+		Button^ button = windowIndex == 1 ? this->buttonMode1 : this->buttonMode2;
+		FlowLayoutPanel^ chips = windowIndex == 1 ? this->flowPanelChips1 : this->flowPanelChips2;
+		List<String^>^ pinned = windowIndex == 1 ? this->pinnedCurves1 : this->pinnedCurves2;
+		if (windowIndex == 1) this->isDirectMode1 = direct;
+		else this->isDirectMode2 = direct;
+		button->Text = direct ? L"DIRECT" : L"UNDIRECT";
+		button->BackColor = direct ? Color::FromArgb(255, 240, 210) : Color::FromArgb(220, 245, 225);
+		chips->Controls->Clear();
+		pinned->Clear();
+		int index = (windowIndex - 1) * 2 + (direct ? 1 : 0);
+		if (this->modeActiveCurves[index] != nullptr || this->modePinnedCurves[index]->Count > 0)
+		{
+			for each (String^ curve in this->modePinnedCurves[index])
+				if (IsCurveValidForMode(curve, direct)) AddCurveChip(windowIndex, curve);
+			String^ restored = this->modeActiveCurves[index];
+			if (!IsCurveValidForMode(restored, direct)) restored = nullptr;
+			if (restored == nullptr) restored = pinned->Count > 0 ? pinned[0] : String::Empty;
+			if (!String::IsNullOrEmpty(restored) && !pinned->Contains(restored)) AddCurveChip(windowIndex, restored);
+			if (windowIndex == 1) this->activeCurve1 = restored;
+			else this->activeCurve2 = restored;
+			UpdateChipStyles(windowIndex);
+			return;
+		}
+		String^ active = windowIndex == 1 ? (direct ? L"Δφ GEO" : L"Raw Δφ") :
+			(direct ? L"Δφ VZX/VZZ" : L"AM Z2/Z1");
+		if (windowIndex == 1)
+		{
+			AddCurveChip(windowIndex, direct ? L"AM GEO" : L"Raw Δφ");
+			AddCurveChip(windowIndex, direct ? L"Δφ GEO" : L"AMP Z1");
+			if (!direct) AddCurveChip(windowIndex, L"RO Δφ Sonde");
+			this->activeCurve1 = active;
 		}
 		else
 		{
-			AddCurveChip(1, L"Разность фаз Δφ (Tx1..Tx5)");
-			AddCurveChip(1, L"Амплитуда Rx1 (Tx1..Tx5)");
-			AddCurveChip(1, L"УЭС по фазе (ρ_ph)");
-			this->activeCurve1 = L"Разность фаз Δφ (Tx1..Tx5)";
+			AddCurveChip(windowIndex, active);
+			AddCurveChip(windowIndex, direct ? L"dV" : L"RO ATT Sonde");
+			this->activeCurve2 = active;
 		}
+		UpdateChipStyles(windowIndex);
+	}
 
-		UpdateChipStyles(1);
-		RenderLoadedCurves();
-		SaveStationConfig();
+	void MainForm::UpdateChartPalette(int windowIndex)
+	{
+		bool direct = windowIndex == 1 ? this->isDirectMode1 : this->isDirectMode2;
+		int receiver = windowIndex == 1 ? this->receiverIndex1 : this->receiverIndex2;
+		cli::array<Color>^ colors = gcnew cli::array<Color> {
+			Color::Green, Color::DarkGoldenrod, Color::Red, Color::RoyalBlue, Color::Magenta };
+		if (direct && receiver == 1)
+		{
+			colors[0] = Color::DarkGoldenrod;
+			colors[1] = Color::Green;
+		}
+		cli::array<int>^ txLabels = !direct ? gcnew cli::array<int> { 1, 2, 3, 4, 5 } :
+			(receiver == 0 ? gcnew cli::array<int> { 1, 2, 4, 5, 0 } : gcnew cli::array<int> { 1, 2, 3, 5, 0 });
+		cli::array<CheckBox^>^ checks = windowIndex == 1 ?
+			gcnew cli::array<CheckBox^> { this->checkTx1_1, this->checkTx1_2, this->checkTx1_3, this->checkTx1_4, this->checkTx1_5 } :
+			gcnew cli::array<CheckBox^> { this->checkTx2_1, this->checkTx2_2, this->checkTx2_3, this->checkTx2_4, this->checkTx2_5 };
+		Chart^ chart = windowIndex == 1 ? this->chartTime1 : this->chartTime2;
+		for (int tx = 0; tx < checks->Length; ++tx)
+		{
+			String^ label = txLabels[tx] > 0 ? L"T" + txLabels[tx].ToString() : L"—";
+			checks[tx]->ForeColor = colors[tx];
+			checks[tx]->Text = label;
+			if (tx >= chart->Series->Count) continue;
+			chart->Series[tx]->Color = colors[tx];
+			chart->Series[tx]->LegendText = label;
+		}
+	}
+
+	void MainForm::UpdateChartHeaderControls()
+	{
+		for (int window = 1; window <= 2; ++window)
+		{
+			bool direct = window == 1 ? this->isDirectMode1 : this->isDirectMode2;
+			Panel^ header = window == 1 ? this->panelTime1Header : this->panelTime2Header;
+			Button^ receiver = window == 1 ? this->buttonReceiver1 : this->buttonReceiver2;
+			if (receiver == nullptr) continue;
+			UpdateChartPalette(window);
+			receiver->Text = (window == 1 ? this->receiverIndex1 : this->receiverIndex2) == 0 ? L"Rx L" : L"Rx R";
+			cli::array<Control^>^ buttons = window == 1 ?
+				gcnew cli::array<Control^> { this->buttonMode1, this->buttonFreq1, receiver, this->buttonXMode1, this->buttonAddCurve1 } :
+				gcnew cli::array<Control^> { this->buttonMode2, this->buttonFreq2, receiver, this->buttonXMode2, this->buttonAddCurve2 };
+			cli::array<bool>^ visible = gcnew cli::array<bool> { this->isCartographLayout, true,
+				this->isCartographLayout && direct, !this->isStreaming, true };
+			int x = 4;
+			for (int i = 0; i < buttons->Length; ++i)
+			{
+				buttons[i]->Visible = visible[i];
+				if (!visible[i]) continue;
+				buttons[i]->Location = Point(x, 3);
+				x += buttons[i]->Width + 4;
+			}
+			FlowLayoutPanel^ chips = window == 1 ? this->flowPanelChips1 : this->flowPanelChips2;
+			chips->Left = x;
+			chips->Width = Math::Max(20, header->ClientSize.Width - x - 8);
+		}
+	}
+
+	System::Void MainForm::buttonMode1_Click(System::Object^ sender, System::EventArgs^ e)
+	{
+		if (!this->isCartographLayout) return;
+		SetChartMode(1, !this->isDirectMode1);
+		RefreshChart(1);
 	}
 
 	System::Void MainForm::buttonMode2_Click(System::Object^ sender, System::EventArgs^ e)
 	{
-		this->isDirectMode2 = !this->isDirectMode2;
-		this->buttonMode2->Text = this->isDirectMode2 ? L"DIRECT" : L"UNDIRECT";
-		this->buttonMode2->BackColor = this->isDirectMode2 ? Color::FromArgb(255, 240, 210) : Color::FromArgb(220, 245, 225);
+		if (!this->isCartographLayout) return;
+		SetChartMode(2, !this->isDirectMode2);
+		RefreshChart(2);
+	}
 
-		this->flowPanelChips2->Controls->Clear();
-		this->pinnedCurves2->Clear();
-
-		if (this->isDirectMode2)
-		{
-			AddCurveChip(2, L"Отношение V_ZX / V_ZZ");
-			AddCurveChip(2, L"Шум dV (мусор)");
-			this->activeCurve2 = L"Отношение V_ZX / V_ZZ";
-		}
-		else
-		{
-			AddCurveChip(2, L"Затухание Att (AM Z2/Z1)");
-			AddCurveChip(2, L"УЭС по затуханию (ρ_att)");
-			this->activeCurve2 = L"Затухание Att (AM Z2/Z1)";
-		}
-
-		UpdateChipStyles(2);
-		RenderLoadedCurves();
-		SaveStationConfig();
+	System::Void MainForm::buttonReceiver_Click(System::Object^ sender, System::EventArgs^ e)
+	{
+		Button^ button = dynamic_cast<Button^>(sender);
+		if (button == nullptr || !this->isCartographLayout) return;
+		int window = safe_cast<int>(button->Tag);
+		if (window == 1 && this->isDirectMode1) this->receiverIndex1 = 1 - this->receiverIndex1;
+		else if (window == 2 && this->isDirectMode2) this->receiverIndex2 = 1 - this->receiverIndex2;
+		else return;
+		RefreshChart(window);
 	}
 
 	System::Void MainForm::buttonFreq1_Click(System::Object^ sender, System::EventArgs^ e)
@@ -1205,8 +1561,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		else
 			this->buttonFreq1->Text = L"2000 кГц";
 
-		RenderLoadedCurves();
-		SaveStationConfig();
+		RefreshChart(1);
 	}
 
 	System::Void MainForm::buttonFreq2_Click(System::Object^ sender, System::EventArgs^ e)
@@ -1216,8 +1571,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		else
 			this->buttonFreq2->Text = L"400 кГц";
 
-		RenderLoadedCurves();
-		SaveStationConfig();
+		RefreshChart(2);
 	}
 
 	System::Void MainForm::buttonFreqRxL_Click(System::Object^ sender, System::EventArgs^ e)
@@ -1251,9 +1605,37 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 	System::Void MainForm::buttonToggleSectors_Click(System::Object^ sender, System::EventArgs^ e)
 	{
 		bool isCollapsed = !this->splitContainerBand1->Panel2Collapsed;
+		this->sectorsCollapsedByUser = isCollapsed;
 		this->splitContainerBand1->Panel2Collapsed = isCollapsed;
 		this->splitContainerBand2->Panel2Collapsed = isCollapsed;
 		this->buttonToggleSectors->Text = isCollapsed ? L"Показать секторы ⮞" : L"⮜ Скрыть секторы";
+	}
+
+	void MainForm::ApplySondeTypeLayout(bool isCarto)
+	{
+		this->isCartographLayout = isCarto;
+		bool changed = !isCarto && (this->isDirectMode1 || this->isDirectMode2);
+		if (!isCarto && this->isDirectMode1) SetChartMode(1, false);
+		if (!isCarto && this->isDirectMode2) SetChartMode(2, false);
+		UpdateChartHeaderControls();
+		if (changed) RenderLoadedCurves();
+		if (isCarto)
+		{
+			// «Картограф»: секторные окна доступны, учитываем выбор пользователя
+			this->buttonToggleSectors->Enabled = true;
+			this->splitContainerBand1->Panel2Collapsed = this->sectorsCollapsedByUser;
+			this->splitContainerBand2->Panel2Collapsed = this->sectorsCollapsedByUser;
+			this->buttonToggleSectors->Text = this->sectorsCollapsedByUser ?
+				L"Показать секторы ⮞" : L"⮜ Скрыть секторы";
+		}
+		else
+		{
+			// GP-приборы: направленных приёмников нет, секторные окна бессмысленны
+			this->splitContainerBand1->Panel2Collapsed = true;
+			this->splitContainerBand2->Panel2Collapsed = true;
+			this->buttonToggleSectors->Enabled = false;
+			this->buttonToggleSectors->Text = L"Секторы: только Картограф";
+		}
 	}
 
 	System::Void MainForm::radioButtonLayout_CheckedChanged(System::Object^ sender, System::EventArgs^ e)
@@ -1355,6 +1737,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		if (chart == nullptr || chart->ChartAreas->Count == 0) return;
 
 		bool isChart1 = (chart == this->chartTime1);
+		SetActiveSchemeChart(isChart1 ? 0 : 1);
 		if (isChart1) { this->mouseDownPoint1 = e->Location; this->panStartPoint1 = e->Location; }
 		else { this->mouseDownPoint2 = e->Location; this->panStartPoint2 = e->Location; }
 
@@ -1408,7 +1791,32 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 				if (isChart1) this->panStartPoint1 = e->Location;
 				else this->panStartPoint2 = e->Location;
 			}
+			return;
 		}
+
+		// Подсказка по кривой под курсором: имя серии и значение ближайшей точки
+		try {
+			HitTestResult^ hit = chart->HitTest(e->X, e->Y);
+			String^ text = nullptr;
+			if (hit != nullptr && hit->Series != nullptr)
+			{
+				Series^ s = hit->Series;
+				String^ seriesName = String::IsNullOrEmpty(s->LegendText) ? s->Name : s->LegendText;
+				text = seriesName;
+				if (hit->PointIndex >= 0 && hit->PointIndex < s->Points->Count)
+				{
+					DataPoint^ p = s->Points[hit->PointIndex];
+					text = seriesName + L"   X=" + p->XValue.ToString("F0") +
+						L"   Y=" + p->YValues[0].ToString("F3");
+				}
+			}
+			if (text != this->lastChartTooltip)
+			{
+				this->lastChartTooltip = text;
+				this->toolTipMain->SetToolTip(chart, text);
+			}
+		}
+		catch (...) {}
 	}
 
 	System::Void MainForm::chartTime_MouseUp(System::Object^ sender, System::Windows::Forms::MouseEventArgs^ e)
@@ -1449,6 +1857,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 	System::Void MainForm::buttonXMode1_Click(System::Object^ sender, System::EventArgs^ e)
 	{
+		if (this->isStreaming) return;
 		this->isTempXAxis1 = !this->isTempXAxis1;
 		this->buttonXMode1->Text = this->isTempXAxis1 ? L"Темп." : L"Кадр";
 		this->buttonXMode1->BackColor = this->isTempXAxis1 ? Color::FromArgb(255, 235, 205) : Color::FromArgb(240, 240, 245);
@@ -1476,12 +1885,12 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 				this->textBoxMax1->Text = (fc - 1).ToString();
 			}
 		}
-		RenderLoadedCurves();
-		SaveStationConfig();
+		RefreshChart(1);
 	}
 
 	System::Void MainForm::buttonXMode2_Click(System::Object^ sender, System::EventArgs^ e)
 	{
+		if (this->isStreaming) return;
 		this->isTempXAxis2 = !this->isTempXAxis2;
 		this->buttonXMode2->Text = this->isTempXAxis2 ? L"Темп." : L"Кадр";
 		this->buttonXMode2->BackColor = this->isTempXAxis2 ? Color::FromArgb(255, 235, 205) : Color::FromArgb(240, 240, 245);
@@ -1509,8 +1918,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 				this->textBoxMax2->Text = (fc - 1).ToString();
 			}
 		}
-		RenderLoadedCurves();
-		SaveStationConfig();
+		RefreshChart(2);
 	}
 
 	System::Void MainForm::comboBoxPrecision1_SelectedIndexChanged(System::Object^ sender, System::EventArgs^ e)
@@ -1723,6 +2131,51 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		catch (...) {}
 	}
 
+	// Инициализация общего канала связи: загрузка EM_Tools_Conf.txt и применение параметров
+	void MainForm::InitConnection()
+	{
+		AppConfig::Instance().Load();
+		this->deviceLink = gcnew DeviceLink(this->components);
+		AppConfig::Instance().ApplyTo(this->deviceLink);
+		// Насос очереди кадров — работает всё время, пока идёт опрос прибора
+		this->timerStream->Tick += gcnew EventHandler(this, &MainForm::timerStream_Tick);
+		SyncConnectionPanel();
+	}
+
+	// Отражение текущих настроек связи в карточке «Связь» боковой панели
+	void MainForm::SyncConnectionPanel()
+	{
+		AppConfig& cfg = AppConfig::Instance();
+		if (cfg.connection_type == CONN_UDP)
+		{
+			this->comboBoxConnType->SelectedIndex = 0;
+			this->textBoxConnParam->Text = gcnew String(cfg.wifi_ip.c_str()) + L":" + cfg.wifi_port.ToString();
+		}
+		else
+		{
+			this->comboBoxConnType->SelectedIndex = 1;
+			this->textBoxConnParam->Text = gcnew String(cfg.com_name.c_str()) + L" @ " + cfg.baud_rate.ToString();
+		}
+	}
+
+	System::Void MainForm::menuItemConnSettings_Click(System::Object^ sender, System::EventArgs^ e)
+	{
+		ConnectionForm^ dlg = gcnew ConnectionForm();
+		if (dlg->ShowDialog(this) == System::Windows::Forms::DialogResult::OK)
+		{
+			bool wasOpen = this->deviceLink != nullptr && this->deviceLink->IsOpen;
+			AppConfig::Instance().ApplyTo(this->deviceLink);
+			SyncConnectionPanel();
+			if (wasOpen)
+			{
+				MessageBox::Show(this,
+					L"Настройки сохранены. Для применения новых параметров канала\nвыполните «Отключить» и «Подключить» заново.",
+					L"Настройки подключения", MessageBoxButtons::OK, MessageBoxIcon::Information);
+			}
+		}
+		delete dlg;
+	}
+
 	System::Void MainForm::buttonConnect_Click(System::Object^ sender, System::EventArgs^ e)
 	{
 		if (!this->isSidebarPinned)
@@ -1730,22 +2183,134 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			HideSidebar();
 		}
 
+		// Режим «Файл данных» не является живым каналом — открываем через меню Файл
+		if (this->comboBoxConnType->SelectedIndex == 2)
+		{
+			MessageBox::Show(this,
+				L"Источник «Файл данных» — это офлайн-режим.\nОткройте файл через меню «Файл → Открыть BIN/LAS...».",
+				L"Подключение", MessageBoxButtons::OK, MessageBoxIcon::Information);
+			return;
+		}
+
+		// Выбор в карточке панели синхронизируем с конфигом связи
+		AppConfig& cfg = AppConfig::Instance();
+		cfg.connection_type = (this->comboBoxConnType->SelectedIndex == 0) ? CONN_UDP : CONN_COM;
+		cfg.ApplyTo(this->deviceLink);
+
+		try
+		{
+			this->deviceLink->Open();
+		}
+		catch (Exception^ ex)
+		{
+			MessageBox::Show(this,
+				L"Не удалось открыть канал связи:\n" + ex->Message +
+				L"\n\nПроверьте настройки в меню «Связь → Настройки...».",
+				L"Ошибка подключения", MessageBoxButtons::OK, MessageBoxIcon::Error);
+			return;
+		}
+
+		// Верификация прибора: запрос сигнатуры (как toolStripButton_on_off в старой программе).
+		// Без ответа прибора канал считается неподключённым (UDP без handshake всегда "открывается").
+		uint32_t signature = 0;
+		bool gotAnswer = false;
+		for (int attempt = 0; attempt < 2 && !gotAnswer; attempt++)
+		{
+			this->deviceLink->ReadTimeout = 2000;
+			gotAnswer = ToolProtocol::RequestSignature(this->deviceLink, signature);
+		}
+		this->deviceLink->ReadTimeout = AppConfig::Instance().read_timeout;
+
+		if (!gotAnswer)
+		{
+			this->deviceLink->Close();
+			this->labelConnStatus->Text = L"● Отключено";
+			this->labelConnStatus->ForeColor = Color::Gray;
+			this->statusLabelConnection->Text = L"● Связь: Нет ответа прибора";
+			this->statusLabelConnection->ForeColor = Color::DarkRed;
+			MessageBox::Show(this,
+				L"Канал открыт, но прибор не ответил на запрос сигнатуры.\n"
+				L"Проверьте питание прибора и параметры связи\n(«Связь → Настройки...»).",
+				L"Прибор не отвечает", MessageBoxButtons::OK, MessageBoxIcon::Warning);
+			return;
+		}
+
+		if (this->connectedSondeId == nullptr) this->connectedSondeId = new SondeID();
+		*this->connectedSondeId = SondeID::FromSignature(signature);
+		UpdateSondeScheme(true);
+		this->sondeScheme->Refresh();
+
 		this->buttonConnect->Enabled = false;
 		this->buttonDisconnect->Enabled = true;
 		this->menuItemConnect->Enabled = false;
 		this->menuItemDisconnect->Enabled = true;
 
-		String^ connInfo = this->comboBoxConnType->Text + L" [" + this->textBoxConnParam->Text + L"]";
+		String^ connDesc = this->deviceLink->GetConnectionDescription();
+		String^ sondeName = Utf8ToManaged(this->connectedSondeId->GetTypeName().c_str());
 		this->labelConnStatus->Text = L"● Подключено";
 		this->labelConnStatus->ForeColor = Color::Green;
-		this->statusLabelConnection->Text = L"● Связь: Подключено (" + this->comboBoxConnType->Text + L")";
+		this->statusLabelConnection->Text = L"● Связь: " + connDesc + L"  |  " + sondeName +
+			L" №" + this->connectedSondeId->number.ToString();
 		this->statusLabelConnection->ForeColor = Color::DarkGreen;
+		this->statusLabelDevice->Text = L"Прибор: " + sondeName;
+		this->statusLabelFile->Text = L"Временный файл: " + LiveFileFullPath();
 
-		std::cout << "[COMM] Подключение запущено: " << std::endl;
+		std::cout << "[COMM] Подключено: " << msclr::interop::marshal_as<std::string>(connDesc)
+			<< " signature=" << signature
+			<< " type=" << this->connectedSondeId->type
+			<< " N_Tx=" << this->connectedSondeId->N_Tx << std::endl;
+
+		// Шаг 2 (как toolStripButton_on_off в старой программе): чтение файла
+		// метрологии из прибора и заполнение структуры сессии — до старта опроса
+		{
+			uint8_t cmd = 0;
+			uint16_t metroLen = 0;
+			uint8_t metroBuf[2048] = { 0 };
+			int metroResult = 1;
+			System::Threading::Thread::Sleep(300);
+			{
+				msclr::lock linkLock(this->deviceLink->SyncRoot);
+				int prevTimeout = this->deviceLink->ReadTimeout;
+				this->deviceLink->ReadTimeout = 2000;
+				uint8_t d0 = 0;
+				if (ToolProtocol::SendToTool(this->deviceLink, CMD_GET_METROLOGY, &d0, 0) == 0)
+				{
+					System::Threading::Thread::Sleep(500);
+					metroResult = ToolProtocol::ReceiveFromTool(this->deviceLink, &cmd, metroBuf, &metroLen);
+				}
+				this->deviceLink->ReadTimeout = prevTimeout;
+			}
+			if (metroResult == 0 && SondeData::SetMetrology(metroBuf, metroLen))
+			{
+				UpdateSondeScheme(true);
+				this->sondeScheme->Refresh();
+				std::cout << "[METRO] Метрология прочитана при подключении: " << metroLen
+					<< " байт" << std::endl;
+				MessageBox::Show(this, L"ФАЙЛ МЕТРОЛОГИИ СЧИТАН ИЗ ПРИБОРА!",
+					L"Метрология", MessageBoxButtons::OK, MessageBoxIcon::Information);
+			}
+			else
+			{
+				SondeData::ClearMetrology();
+				std::cout << "[METRO] Метрология при подключении не прочитана: result="
+					<< metroResult << " len=" << metroLen << std::endl;
+				MessageBox::Show(this, L"ФАЙЛ МЕТРОЛОГИИ НЕ БЫЛ СЧИТАН !!!",
+					L"Метрология", MessageBoxButtons::OK, MessageBoxIcon::Warning);
+			}
+		}
+
+		// Опрос прибора и запись во временный файл — всегда, пока есть связь
+		StartTelemetry();
 	}
 
 	System::Void MainForm::buttonDisconnect_Click(System::Object^ sender, System::EventArgs^ e)
 	{
+		StopTelemetry();
+		if (this->deviceLink != nullptr)
+		{
+			this->deviceLink->Close();
+		}
+
 		this->buttonConnect->Enabled = true;
 		this->buttonDisconnect->Enabled = false;
 		this->menuItemConnect->Enabled = true;
@@ -1755,6 +2320,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		this->labelConnStatus->ForeColor = Color::Gray;
 		this->statusLabelConnection->Text = L"● Связь: Отключено";
 		this->statusLabelConnection->ForeColor = Color::DimGray;
+		this->statusLabelDevice->Text = L"Прибор: —";
 
 		std::cout << "[COMM] Соединение остановлено пользователем." << std::endl;
 	}
@@ -1984,8 +2550,16 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 	System::Void MainForm::menuItemMetroParams_Click(System::Object^ sender, System::EventArgs^ e)
 	{
-		MetroForm^ metroForm = gcnew MetroForm();
+		MetroForm^ metroForm = gcnew MetroForm(this->deviceLink);
+		// Сигнатура из прочитанной метрологии приоритетнее сессионной
+		if (!SondeData::HasMetrology())
+		{
+			uint32_t sig = SondeData::GetSignature();
+			if (sig != 0)
+				metroForm->ApplySondeSignature(sig);
+		}
 		metroForm->ShowDialog(this);
+		if (SondeData::IsLoaded()) RenderLoadedCurves();
 	}
 
 	System::Void MainForm::menuItemOpenBin_Click(System::Object^ sender, System::EventArgs^ e)
@@ -1993,6 +2567,71 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		if (this->openFileDialogBin->ShowDialog() == System::Windows::Forms::DialogResult::OK)
 		{
 			LoadDataFile(this->openFileDialogBin->FileName);
+		}
+	}
+
+	System::Void MainForm::menuItemOpenTemp_Click(System::Object^ sender, System::EventArgs^ e)
+	{
+		// Открыть временный файл телеметрии напрямую (аналог открытия Dataout в старой программе)
+		String^ path = (this->liveFilePath != nullptr && this->liveFilePath->Length > 0)
+			? this->liveFilePath
+			: LiveFileFullPath();
+		if (!System::IO::File::Exists(path))
+		{
+			MessageBox::Show(this,
+				L"Временный файл ещё не создан.\n" + path,
+				L"Нет данных", MessageBoxButtons::OK, MessageBoxIcon::Information);
+			return;
+		}
+		LoadDataFile(path);
+	}
+
+	System::Void MainForm::menuItemClearTemp_Click(System::Object^ sender, System::EventArgs^ e)
+	{
+		// Сброс временного файла телеметрии (аналог «delete» в старой программе).
+		// Опрос прибора продолжается — запись возобновляется в новый пустой файл.
+		StopDisplay();
+		cli::array<Byte>^ skip;
+		while (this->frameQueue != nullptr && this->frameQueue->TryDequeue(skip)) {}
+		SondeData::BeginLiveSession();
+		this->isLiveSession = true;
+		for (int s = 0; s < this->chartTime1->Series->Count; s++)
+			this->chartTime1->Series[s]->Points->Clear();
+		for (int s = 0; s < this->chartTime2->Series->Count; s++)
+			this->chartTime2->Series[s]->Points->Clear();
+		if (this->liveFout != nullptr && this->liveFout->is_open())
+		{
+			this->liveFout->close();
+		}
+		String^ path = (this->liveFilePath != nullptr && this->liveFilePath->Length > 0)
+			? this->liveFilePath
+			: LiveFileFullPath();
+		if (!System::IO::File::Exists(path))
+		{
+			this->statusLabelFile->Text = L"Временный файл: " + path + L" (пуст)";
+			return;
+		}
+		if (MessageBox::Show(this,
+				L"Удалить временный файл записи телеметрии?\n" + path,
+				L"Очистка временного файла",
+				MessageBoxButtons::YesNo, MessageBoxIcon::Question) == System::Windows::Forms::DialogResult::Yes)
+		{
+			try { System::IO::File::Delete(path); }
+			catch (Exception^ ex)
+			{
+				MessageBox::Show(this, L"Не удалось удалить файл: " + ex->Message,
+					L"Ошибка", MessageBoxButtons::OK, MessageBoxIcon::Warning);
+			}
+			if (!System::IO::File::Exists(path))
+			{
+				if (this->liveFout != nullptr && this->liveFout->is_open() == false &&
+					this->liveFilePath == path)
+				{
+					std::string pn = msclr::interop::marshal_as<std::string>(path);
+					this->liveFout->open(pn, std::ios::binary | std::ios::app);
+				}
+				this->statusLabelFile->Text = L"Временный файл: " + path + L" (очищен)";
+			}
 		}
 	}
 
@@ -2018,35 +2657,50 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 	System::Void MainForm::buttonStream_Click(System::Object^ sender, System::EventArgs^ e)
 	{
-		this->isStreaming = !this->isStreaming;
-		if (this->isStreaming)
+		// ПОТОК = приём телеметрии с прибора по общему каналу (как Timer_get_data_from_sonde)
+		if (this->deviceLink == nullptr || !this->deviceLink->IsOpen)
 		{
-			this->buttonStream->BackColor = Color::FromArgb(255, 192, 192);
-			this->buttonStream->Text = L"ПОТОК [ВКЛ]";
-			this->timerStream->Start();
+			MessageBox::Show(this,
+				L"Телеметрия требует активного подключения к прибору.\nСначала выполните «Связь → Подключить».",
+				L"Нет связи", MessageBoxButtons::OK, MessageBoxIcon::Information);
+			return;
+		}
+
+		if (!this->isStreaming)
+		{
+			StartDisplay();
 		}
 		else
 		{
-			this->buttonStream->BackColor = SystemColors::Control;
-			this->buttonStream->Text = L"ПОТОК";
-			this->timerStream->Stop();
+			StopDisplay();
 		}
 	}
 
 	System::Void MainForm::buttonRefresh_Click(System::Object^ sender, System::EventArgs^ e)
 	{
-		// 1. Остановка режима поток при обновлении
-		if (this->isStreaming)
-		{
-			this->isStreaming = false;
-			this->timerStream->Stop();
-			this->buttonStream->BackColor = SystemColors::Control;
-			this->buttonStream->Text = L"ПОТОК";
-		}
+		// 1. Выключить окно потока — опрос и запись продолжаются (как в старой программе)
+		StopDisplay();
 
-		// 2. Применение диапазонов Min..Max (или полного графика при пустых полях)
-		ApplyRange(1);
-		ApplyRange(2);
+		// 2. Весь записанный файл целиком (min=0, max=конец)
+		if (SondeData::IsLoaded())
+		{
+			size_t fc = SondeData::GetFrameCount();
+			this->minFrame1 = 0;
+			this->maxFrame1 = (int)fc - 1;
+			this->minFrame2 = 0;
+			this->maxFrame2 = (int)fc - 1;
+			this->textBoxMin1->Text = L"0";
+			this->textBoxMax1->Text = (fc > 0 ? fc - 1 : 0).ToString();
+			this->textBoxMin2->Text = L"0";
+			this->textBoxMax2->Text = (fc > 0 ? fc - 1 : 0).ToString();
+			RenderLoadedCurves();
+			UpdateTimeSlices((double)(fc > 0 ? fc - 1 : 0));
+		}
+		else
+		{
+			ApplyRange(1);
+			ApplyRange(2);
+		}
 
 		// 3. Авто-масштаб оси Y
 		this->chartTime1->ChartAreas[0]->AxisY->Minimum = Double::NaN;
@@ -2055,48 +2709,314 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		this->chartTime2->ChartAreas[0]->AxisY->Maximum = Double::NaN;
 	}
 
+	// --- Онлайн-телеметрия ---------------------------------------------------
+
+	String^ MainForm::LiveFileBase()
+	{
+		String^ fileBase = L"Dataout.bin";
+		if (this->connectedSondeId != nullptr)
+		{
+			switch (this->connectedSondeId->type)
+			{
+			case CARTOGRAPH_: case CARTOGRAPH_RAW_: fileBase = L"Dataout_cartograf.bin"; break;
+			case CARTOGRAPH_LWD_4Tx_:                fileBase = L"Dataout_CARTOGRAPH_LWD_4Tx.bin"; break;
+			case LWD_4Tx_NEW_:                      fileBase = L"Dataout_LWD_4Tx_NEW.bin"; break;
+			case LWD_3Tx_:                          fileBase = L"Dataout_LWD_3Tx.bin"; break;
+			case AUTONOM_5Tx_:                      fileBase = L"Dataout_AUTONOM_5Tx.bin"; break;
+			case AUTONOM_5Tx_SDR_:                  fileBase = L"Dataout_AUTONOM_5Tx_SDR.bin"; break;
+			}
+		}
+		return fileBase;
+	}
+
+	String^ MainForm::LiveFileFullPath()
+	{
+		String^ dir = gcnew String(AppConfig::Instance().data_folder.c_str());
+		if (!System::IO::Directory::Exists(dir))
+		{
+			try { System::IO::Directory::CreateDirectory(dir); }
+			catch (...) { dir = System::IO::Path::GetDirectoryName(Application::ExecutablePath); }
+		}
+		return dir + L"\\" + LiveFileBase();
+	}
+
+	// Опрос прибора + запись во временный файл — запускается по «Подключить»,
+	// идёт всегда, пока есть связь (аналог Timer_get_data_from_sonde в старой программе)
+	void MainForm::StartTelemetry()
+	{
+		if (this->telemetryRunning) return;
+
+		// Сессия не очищается: накопленные кадры живут, файл дописывается.
+		// Очистка — только если в памяти не онлайн-данные (открытый файл/пусто).
+		if (!this->isLiveSession)
+		{
+			SondeData::BeginLiveSession();
+			this->isLiveSession = true;
+
+			for (int s = 0; s < this->chartTime1->Series->Count; s++)
+				this->chartTime1->Series[s]->Points->Clear();
+			for (int s = 0; s < this->chartTime2->Series->Count; s++)
+				this->chartTime2->Series[s]->Points->Clear();
+			this->minFrame1 = 0; this->maxFrame1 = -1;
+			this->minFrame2 = 0; this->maxFrame2 = -1;
+		}
+
+		// Файл записи телеметрии — фиксированное имя по типу прибора, append
+		this->liveFileName = LiveFileBase();
+		this->liveFilePath = LiveFileFullPath();
+		if (this->liveFout == nullptr)
+		{
+			msclr::interop::marshal_context mctx;
+			std::string livePathNative = mctx.marshal_as<std::string>(this->liveFilePath);
+			this->liveFout = new std::ofstream(livePathNative, std::ios::binary | std::ios::app);
+			std::cout << "[COMM] Запись телеметрии в " << livePathNative << std::endl;
+		}
+
+		this->telemetryRx = 0; this->telemetryTimeouts = 0; this->telemetryCrcErr = 0;
+		this->telemetryRunning = true;
+
+		this->telemetryThread = gcnew System::Threading::Thread(
+			gcnew System::Threading::ThreadStart(this, &MainForm::TelemetryWorker));
+		this->telemetryThread->IsBackground = true;
+		this->telemetryThread->Start();
+
+		this->timerStream->Interval = 250;
+		this->timerStream->Start();
+		this->statusLabelFile->Text = L"ОНЛАЙН → " + this->liveFileName;
+	}
+
+	// Остановка опроса+записи — только по «Отключить»/закрытию программы
+	void MainForm::StopTelemetry()
+	{
+		this->telemetryRunning = false;
+		if (this->telemetryThread != nullptr && this->telemetryThread->IsAlive)
+		{
+			this->telemetryThread->Join(4000);
+		}
+		this->telemetryThread = nullptr;
+		this->timerStream->Stop();
+
+		// Добрать остаток очереди
+		DrainFrameQueue();
+
+		if (this->liveFout != nullptr)
+		{
+			this->liveFout->close();
+			delete this->liveFout;
+			this->liveFout = nullptr;
+		}
+
+		StopDisplay();
+		std::cout << "[COMM] Опрос прибора остановлен. Принято кадров: " << this->telemetryRx << std::endl;
+	}
+
+	// «ПОТОК» вкл — только отображение окна последних points кадров
+	void MainForm::StartDisplay()
+	{
+		this->isStreaming = true;
+		this->isTempXAxis1 = false;
+		this->isTempXAxis2 = false;
+		this->buttonXMode1->Text = L"Кадр";
+		this->buttonXMode2->Text = L"Кадр";
+		this->buttonXMode1->BackColor = Color::FromArgb(240, 240, 245);
+		this->buttonXMode2->BackColor = Color::FromArgb(240, 240, 245);
+		for each (Chart^ chart in gcnew cli::array<Chart^> { this->chartTime1, this->chartTime2 })
+		{
+			Axis^ axis = chart->ChartAreas[0]->AxisX;
+			axis->ScaleView->ZoomReset(0);
+			axis->Minimum = Double::NaN;
+			axis->Maximum = Double::NaN;
+			axis->Title = L"Кадр (N)";
+		}
+		UpdateChartHeaderControls();
+		this->buttonStream->BackColor = Color::FromArgb(255, 192, 192);
+		this->buttonStream->Text = L"ПОТОК [ВКЛ]";
+
+		// Показать последние points из уже накопленных кадров
+		if (SondeData::IsLoaded())
+		{
+			size_t fc = SondeData::GetFrameCount();
+			int win = (int)AppConfig::Instance().points;
+			int maxI = (int)fc - 1;
+			int minW = Math::Max(0, maxI - win + 1);
+			this->minFrame1 = minW; this->maxFrame1 = maxI;
+			this->minFrame2 = minW; this->maxFrame2 = maxI;
+			this->textBoxMin1->Text = minW.ToString();
+			this->textBoxMax1->Text = maxI.ToString();
+			this->textBoxMin2->Text = minW.ToString();
+			this->textBoxMax2->Text = maxI.ToString();
+			RenderLoadedCurves();
+			this->chartTime1->ChartAreas[0]->AxisX->Minimum = minW;
+			this->chartTime1->ChartAreas[0]->AxisX->Maximum = Math::Max(minW + 1, maxI);
+			this->chartTime2->ChartAreas[0]->AxisX->Minimum = minW;
+			this->chartTime2->ChartAreas[0]->AxisX->Maximum = Math::Max(minW + 1, maxI);
+		}
+	}
+
+	// «ПОТОК» выкл — графики замирают, опрос и запись продолжаются
+	void MainForm::StopDisplay()
+	{
+		this->isStreaming = false;
+		this->buttonStream->BackColor = SystemColors::Control;
+		this->buttonStream->Text = L"ПОТОК";
+		UpdateChartHeaderControls();
+	}
+
+	// Фоновый поток: циклический опрос прибора CMD_GET_DATA (как timer_get_data_from_sonde)
+	void MainForm::TelemetryWorker()
+	{
+		uint8_t d0 = 0;
+		const int bufSize = 4096;
+		uint8_t dataIn[bufSize] = { 0 };
+
+		// Опрос идёт всегда, пока открыт канал — даже если прибор молчит/вышел из строя.
+		// Период запросов = get_data_interval из настроек (как Timer_get_data_from_sonde).
+		while (this->telemetryRunning && this->deviceLink != nullptr && this->deviceLink->IsOpen)
+		{
+			int result;
+			uint16_t incomeLen = 0;
+			try
+			{
+				// Обмен целиком под замком: сервисные команды (метрология и пр.)
+				// по тому же каналу ждут конца текущего цикла, а не рвут пакет
+				msclr::lock linkLock(this->deviceLink->SyncRoot);
+				if (ToolProtocol::SendToTool(this->deviceLink, CMD_GET_DATA, &d0, 0) != 0)
+				{
+					this->telemetryTimeouts++;
+					continue;
+				}
+				System::Threading::Thread::Sleep(300); // ожидание ответа, как Sleep(300..1000) в старой
+
+				uint8_t cmd = 0;
+				result = ToolProtocol::ReceiveFromTool(this->deviceLink, &cmd, dataIn, &incomeLen);
+			}
+			catch (...)
+			{
+				// Поток не должен умирать молча: любой сбой канала — таймаут, опрос продолжается
+				this->telemetryTimeouts++;
+				System::Threading::Thread::Sleep((int)AppConfig::Instance().get_data_interval);
+				continue;
+			}
+
+			{
+				if (result == 0 && incomeLen > 0)
+				{
+					cli::array<Byte>^ frame = gcnew cli::array<Byte>(incomeLen);
+					for (int i = 0; i < incomeLen; i++) frame[i] = dataIn[i];
+					this->frameQueue->Enqueue(frame);
+					this->telemetryRx++;
+				}
+				else if (result == 2)
+				{
+					this->telemetryCrcErr++;
+				}
+				else
+				{
+					this->telemetryTimeouts++;
+				}
+			}
+			System::Threading::Thread::Sleep((int)AppConfig::Instance().get_data_interval);
+		}
+	}
+
+	// UI-насос: разбирает очередь принятых кадров.
+	// Разбор и запись в файл — всегда; отрисовка — только в режиме «ПОТОК».
+	void MainForm::DrainFrameQueue()
+	{
+		cli::array<Byte>^ frame;
+		while (this->frameQueue != nullptr && this->frameQueue->TryDequeue(frame))
+		{
+			pin_ptr<Byte> p = &frame[0];
+			size_t added = SondeData::AppendLiveRecord(p, frame->Length);
+
+			if (added > 0)
+			{
+				// Запись полного кадра в BIN-файл — всегда
+				const uint8_t* recData = nullptr;
+				size_t recLen = 0;
+				if (this->liveFout != nullptr && this->liveFout->is_open()
+					&& SondeData::GetLastRecordBytes(&recData, &recLen) && recData != nullptr)
+				{
+					this->liveFout->write(reinterpret_cast<const char*>(recData), recLen);
+					this->liveFout->flush();
+				}
+
+				size_t lastIdx = SondeData::GetFrameCount() - 1;
+				size_t fc = SondeData::GetFrameCount();
+				String^ sondeName = Utf8ToManaged(SondeData::GetSondeName());
+				this->statusLabelFile->Text = L"ОНЛАЙН → " + this->liveFileName + L" | " + sondeName + L" | Кадров: " + fc.ToString();
+
+				if (this->isStreaming)
+				{
+					AppendFrameToCharts(lastIdx);
+					UpdateTimeSlices(this->isTempXAxis1 ? SondeData::GetTemperature(lastIdx) : (double)lastIdx);
+				}
+			}
+		}
+
+		// Диагностика в статусбаре — пока идёт опрос
+		if (this->telemetryRunning)
+		{
+			this->statusLabelConnection->Text = L"● Связь: " +
+				this->deviceLink->GetConnectionDescription() +
+				L"  |  Кадров: " + this->telemetryRx.ToString() +
+				L"  Таймауты: " + this->telemetryTimeouts.ToString() +
+				L"  CRC: " + this->telemetryCrcErr.ToString();
+		}
+	}
+
+	// Добавить одну точку кадра на оба графика (аналог тела цикла RenderLoadedCurves)
+	void MainForm::AppendFrameToCharts(size_t i)
+	{
+		if (!SondeData::IsLoaded()) return;
+		int txCount = SondeData::GetTxCount();
+		int freq1 = (this->buttonFreq1->Text->Contains(L"2000")) ? 1 : 0;
+		int freq2 = (this->buttonFreq2->Text->Contains(L"2000")) ? 1 : 0;
+		int curveType1 = GetCurveTypeByName(this->activeCurve1);
+		int curveType2 = GetCurveTypeByName(this->activeCurve2);
+
+		double x1 = this->isTempXAxis1 ? SondeData::GetTemperature(i) : (double)i;
+		if (!String::IsNullOrEmpty(this->activeCurve1))
+			for (int tx = 0; tx < txCount && tx < this->chartTime1->Series->Count; ++tx)
+				AddCurvePoint(this->chartTime1->Series[tx], x1, SondeData::GetCurveValue(curveType1, freq1, tx, i, this->receiverIndex1));
+
+		double x2 = this->isTempXAxis2 ? SondeData::GetTemperature(i) : (double)i;
+		if (!String::IsNullOrEmpty(this->activeCurve2))
+			for (int tx = 0; tx < txCount && tx < this->chartTime2->Series->Count; ++tx)
+				AddCurvePoint(this->chartTime2->Series[tx], x2, SondeData::GetCurveValue(curveType2, freq2, tx, i, this->receiverIndex2));
+
+		// Скользящее окно последних Points кадров (как Points в старой программе)
+		int win = (int)AppConfig::Instance().points;
+		for (int s = 0; s < this->chartTime1->Series->Count; s++)
+			while (this->chartTime1->Series[s]->Points->Count > win)
+				this->chartTime1->Series[s]->Points->RemoveAt(0);
+		for (int s = 0; s < this->chartTime2->Series->Count; s++)
+			while (this->chartTime2->Series[s]->Points->Count > win)
+				this->chartTime2->Series[s]->Points->RemoveAt(0);
+
+		int minW = Math::Max(0, (int)i - win + 1);
+		this->minFrame1 = minW;
+		this->minFrame2 = minW;
+		this->maxFrame1 = (int)i;
+		this->maxFrame2 = (int)i;
+		this->textBoxMin1->Text = minW.ToString();
+		this->textBoxMax1->Text = i.ToString();
+		this->textBoxMin2->Text = minW.ToString();
+		this->textBoxMax2->Text = i.ToString();
+
+		// Ось X следует за окном потока — данные движутся налево (как в старой программе)
+		this->chartTime1->ChartAreas[0]->AxisX->Minimum = minW;
+		this->chartTime1->ChartAreas[0]->AxisX->Maximum = Math::Max((double)minW + 1, (double)i);
+		this->chartTime2->ChartAreas[0]->AxisX->Minimum = minW;
+		this->chartTime2->ChartAreas[0]->AxisX->Maximum = Math::Max((double)minW + 1, (double)i);
+
+		this->chartTime1->Invalidate();
+		this->chartTime2->Invalidate();
+	}
+
 	System::Void MainForm::timerStream_Tick(System::Object^ sender, System::EventArgs^ e)
 	{
-		this->currentStreamPoint++;
-		int i = this->currentStreamPoint;
-		double t = i * 0.1;
-
-		double valBase = 15.0 + 5.0 * Math::Sin(t * 0.05);
-		this->chartTime1->Series[0]->Points->AddXY(t, valBase + 2.0 * Math::Sin(t * 0.2));
-		this->chartTime1->Series[1]->Points->AddXY(t, valBase * 0.9 + 1.8 * Math::Sin(t * 0.2 + 0.3));
-		this->chartTime1->Series[2]->Points->AddXY(t, valBase * 0.8 + 1.5 * Math::Sin(t * 0.2 + 0.6));
-		this->chartTime1->Series[3]->Points->AddXY(t, valBase * 0.7 + 1.2 * Math::Sin(t * 0.2 + 0.9));
-		this->chartTime1->Series[4]->Points->AddXY(t, valBase * 0.6 + 1.0 * Math::Sin(t * 0.2 + 1.2));
-
-		double valBase2 = 8.0 + 3.0 * Math::Cos(t * 0.04);
-		this->chartTime2->Series[0]->Points->AddXY(t, valBase2 + 1.2 * Math::Cos(t * 0.18));
-		this->chartTime2->Series[1]->Points->AddXY(t, valBase2 * 0.9 + 1.0 * Math::Cos(t * 0.18 + 0.3));
-		this->chartTime2->Series[2]->Points->AddXY(t, valBase2 * 0.8 + 0.8 * Math::Cos(t * 0.18 + 0.6));
-		this->chartTime2->Series[3]->Points->AddXY(t, valBase2 * 0.7 + 0.6 * Math::Cos(t * 0.18 + 0.9));
-		this->chartTime2->Series[4]->Points->AddXY(t, valBase2 * 0.6 + 0.5 * Math::Cos(t * 0.18 + 1.2));
-
-		// Скользящее бегущее окно 100 точек
-		int minPt = Math::Max(0, i - 100);
-		int maxPt = i;
-
-		this->textBoxMin1->Text = minPt.ToString();
-		this->textBoxMax1->Text = maxPt.ToString();
-		this->textBoxMin2->Text = minPt.ToString();
-		this->textBoxMax2->Text = maxPt.ToString();
-
-		double minTime = minPt * 0.1;
-		double maxTime = maxPt * 0.1;
-
-		this->chartTime1->ChartAreas[0]->AxisX->Minimum = minTime;
-		this->chartTime1->ChartAreas[0]->AxisX->Maximum = maxTime;
-		this->chartTime2->ChartAreas[0]->AxisX->Minimum = minTime;
-		this->chartTime2->ChartAreas[0]->AxisX->Maximum = maxTime;
-
-		this->chartTime1->ChartAreas[0]->CursorX->Position = maxTime;
-		this->chartTime2->ChartAreas[0]->CursorX->Position = maxTime;
-
-		UpdateTimeSlices(maxTime);
-		UpdateCursorReadout(maxTime);
+		DrainFrameQueue();
 	}
 
 	System::Void MainForm::buttonApplyRange1_Click(System::Object^ sender, System::EventArgs^ e)
@@ -2473,15 +3393,19 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 	{
 		try
 		{
+			RememberChartMode(1);
+			RememberChartMode(2);
 			String^ configPath = System::IO::Path::Combine(Application::StartupPath, L"station_config.json");
 			System::Text::StringBuilder^ sb = gcnew System::Text::StringBuilder();
 			sb->AppendLine(L"{");
 
 			// Window1
 			sb->AppendLine(L"  \"Window1\": {");
+			AppendModeConfig(sb, 1);
 			sb->AppendLine(String::Format(L"    \"ActiveCurve\": \"{0}\",", this->activeCurve1 != nullptr ? this->activeCurve1 : L""));
 			sb->AppendLine(String::Format(L"    \"Freq\": \"{0}\",", this->buttonFreq1->Text));
 			sb->AppendLine(String::Format(L"    \"Mode\": \"{0}\",", this->buttonMode1->Text));
+			sb->AppendLine(String::Format(L"    \"Receiver\": {0},", this->receiverIndex1));
 			sb->AppendLine(String::Format(L"    \"IsTempX\": {0},", this->isTempXAxis1 ? L"true" : L"false"));
 			sb->AppendLine(String::Format(L"    \"HoldZoom\": {0},", this->checkHoldZoom1->Checked ? L"true" : L"false"));
 			sb->AppendLine(String::Format(L"    \"Precision\": {0},", this->precisionY1));
@@ -2501,9 +3425,11 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 			// Window2
 			sb->AppendLine(L"  \"Window2\": {");
+			AppendModeConfig(sb, 2);
 			sb->AppendLine(String::Format(L"    \"ActiveCurve\": \"{0}\",", this->activeCurve2 != nullptr ? this->activeCurve2 : L""));
 			sb->AppendLine(String::Format(L"    \"Freq\": \"{0}\",", this->buttonFreq2->Text));
 			sb->AppendLine(String::Format(L"    \"Mode\": \"{0}\",", this->buttonMode2->Text));
+			sb->AppendLine(String::Format(L"    \"Receiver\": {0},", this->receiverIndex2));
 			sb->AppendLine(String::Format(L"    \"IsTempX\": {0},", this->isTempXAxis2 ? L"true" : L"false"));
 			sb->AppendLine(String::Format(L"    \"HoldZoom\": {0},", this->checkHoldZoom2->Checked ? L"true" : L"false"));
 			sb->AppendLine(String::Format(L"    \"Precision\": {0},", this->precisionY2));
@@ -2542,16 +3468,16 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		if (!System::IO::File::Exists(configPath))
 		{
 			// Файла конфигурации еще нет - настраиваем кнопки по умолчанию и сохраняем
-			AddCurveChip(1, L"Разность фаз Δφ (Tx1..Tx5)");
-			AddCurveChip(1, L"Амплитуда Rx1 (Tx1..Tx5)");
-			AddCurveChip(1, L"Амплитуда Rx2 (Tx1..Tx5)");
-			AddCurveChip(1, L"УЭС по фазе (ρ_ph)");
+			AddCurveChip(1, L"Raw Δφ");
+			AddCurveChip(1, L"AMP Z1");
+			AddCurveChip(1, L"AMP Z2");
+			AddCurveChip(1, L"RO Δφ");
 
-			AddCurveChip(2, L"Затухание Att (AM Z2/Z1)");
-			AddCurveChip(2, L"УЭС по затуханию (ρ_att)");
+			AddCurveChip(2, L"AM Z2/Z1");
+			AddCurveChip(2, L"RO ATT");
 
-			this->activeCurve1 = L"Разность фаз Δφ (Tx1..Tx5)";
-			this->activeCurve2 = L"Затухание Att (AM Z2/Z1)";
+			this->activeCurve1 = L"Raw Δφ";
+			this->activeCurve2 = L"AM Z2/Z1";
 
 			UpdateChipStyles(1);
 			UpdateChipStyles(2);
@@ -2562,7 +3488,19 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		try
 		{
 			cli::array<String^>^ lines = System::IO::File::ReadAllLines(configPath, System::Text::Encoding::UTF8);
+			for (int mode = 0; mode < 4; ++mode)
+			{
+				this->modePinnedCurves[mode]->Clear();
+				this->modeActiveCurves[mode] = nullptr;
+			}
+			this->pinnedCurves1->Clear();
+			this->pinnedCurves2->Clear();
+			this->flowPanelChips1->Controls->Clear();
+			this->flowPanelChips2->Controls->Clear();
+			this->activeCurve1 = nullptr;
+			this->activeCurve2 = nullptr;
 			int currentSection = 0; // 1 = Window1, 2 = Window2, 3 = Sectors
+			bool pinnedSeen1 = false, pinnedSeen2 = false;
 
 			for each (String^ rawLine in lines)
 			{
@@ -2571,6 +3509,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 				else if (line->Contains(L"\"Window2\"")) currentSection = 2;
 				else if (line->Contains(L"\"Sectors\"")) currentSection = 3;
 
+				if ((currentSection == 1 || currentSection == 2) && LoadModeConfigLine(currentSection, line)) continue;
 				if (currentSection == 1)
 				{
 					if (line->StartsWith(L"\"ActiveCurve\":"))
@@ -2590,6 +3529,12 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 						this->buttonMode1->Text = this->isDirectMode1 ? L"DIRECT" : L"UNDIRECT";
 						this->buttonMode1->BackColor = this->isDirectMode1 ?
 							Color::FromArgb(255, 240, 210) : Color::FromArgb(220, 245, 225);
+					}
+					else if (line->StartsWith(L"\"Receiver\":"))
+					{
+						int receiver = 0;
+						if (Int32::TryParse(line->Substring(line->IndexOf(':') + 1)->Trim()->Trim(','), receiver) && receiver >= 0 && receiver <= 1)
+							this->receiverIndex1 = receiver;
 					}
 					else if (line->StartsWith(L"\"IsTempX\":"))
 					{
@@ -2637,6 +3582,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 					}
 					else if (line->StartsWith(L"\"PinnedCurves\":"))
 					{
+						pinnedSeen1 = true;
 						int b1 = line->IndexOf('[');
 						int b2 = line->IndexOf(']');
 						if (b1 >= 0 && b2 > b1)
@@ -2646,7 +3592,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 							for each (String^ p in parts)
 							{
 								String^ c = p->Trim()->Trim('"');
-								if (!String::IsNullOrEmpty(c)) AddCurveChip(1, c);
+								if (IsCurveValidForMode(c, this->isDirectMode1)) AddCurveChip(1, c);
 							}
 						}
 					}
@@ -2670,6 +3616,12 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 						this->buttonMode2->Text = this->isDirectMode2 ? L"DIRECT" : L"UNDIRECT";
 						this->buttonMode2->BackColor = this->isDirectMode2 ?
 							Color::FromArgb(255, 240, 210) : Color::FromArgb(220, 245, 225);
+					}
+					else if (line->StartsWith(L"\"Receiver\":"))
+					{
+						int receiver = 0;
+						if (Int32::TryParse(line->Substring(line->IndexOf(':') + 1)->Trim()->Trim(','), receiver) && receiver >= 0 && receiver <= 1)
+							this->receiverIndex2 = receiver;
 					}
 					else if (line->StartsWith(L"\"IsTempX\":"))
 					{
@@ -2717,6 +3669,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 					}
 					else if (line->StartsWith(L"\"PinnedCurves\":"))
 					{
+						pinnedSeen2 = true;
 						int b1 = line->IndexOf('[');
 						int b2 = line->IndexOf(']');
 						if (b1 >= 0 && b2 > b1)
@@ -2726,7 +3679,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 							for each (String^ p in parts)
 							{
 								String^ c = p->Trim()->Trim('"');
-								if (!String::IsNullOrEmpty(c)) AddCurveChip(2, c);
+								if (IsCurveValidForMode(c, this->isDirectMode2)) AddCurveChip(2, c);
 							}
 						}
 					}
@@ -2760,39 +3713,95 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 				}
 			}
 
-			// Если после загрузки список пуст - добавляем дефолтные
-			if (this->pinnedCurves1->Count == 0)
+			// Дефолтные чипы добавляются только если ключ PinnedCurves отсутствовал вовсе;
+			// явно сохранённый пустой список означает пустой график
+			if (!pinnedSeen1)
 			{
-				AddCurveChip(1, L"Разность фаз Δφ (Tx1..Tx5)");
-				AddCurveChip(1, L"Амплитуда Rx1 (Tx1..Tx5)");
+				AddCurveChip(1, L"Raw Δφ");
+				AddCurveChip(1, L"AMP Z1");
 			}
-			if (this->pinnedCurves2->Count == 0)
+			if (!pinnedSeen2)
 			{
-				AddCurveChip(2, L"Затухание Att (AM Z2/Z1)");
-				AddCurveChip(2, L"УЭС по затуханию (ρ_att)");
+				AddCurveChip(2, L"AM Z2/Z1");
+				AddCurveChip(2, L"RO ATT");
 			}
 
+			this->activeCurve1 = NormalizeCurveName(this->activeCurve1);
+			this->activeCurve2 = NormalizeCurveName(this->activeCurve2);
+			if (!IsCurveValidForMode(this->activeCurve1, this->isDirectMode1))
+				this->activeCurve1 = this->pinnedCurves1->Count > 0 ? this->pinnedCurves1[0] : nullptr;
+			if (!IsCurveValidForMode(this->activeCurve2, this->isDirectMode2))
+				this->activeCurve2 = this->pinnedCurves2->Count > 0 ? this->pinnedCurves2[0] : nullptr;
 			if (String::IsNullOrEmpty(this->activeCurve1) && this->pinnedCurves1->Count > 0)
 				this->activeCurve1 = this->pinnedCurves1[0];
 			if (String::IsNullOrEmpty(this->activeCurve2) && this->pinnedCurves2->Count > 0)
 				this->activeCurve2 = this->pinnedCurves2[0];
 
+			RememberChartMode(1);
+			RememberChartMode(2);
 			UpdateChipStyles(1);
 			UpdateChipStyles(2);
+			UpdateSondeScheme();
 		}
 		catch (...)
 		{
-			AddCurveChip(1, L"Разность фаз Δφ (Tx1..Tx5)");
-			AddCurveChip(2, L"Затухание Att (AM Z2/Z1)");
-			this->activeCurve1 = L"Разность фаз Δφ (Tx1..Tx5)";
-			this->activeCurve2 = L"Затухание Att (AM Z2/Z1)";
+			AddCurveChip(1, L"Raw Δφ");
+			AddCurveChip(2, L"AM Z2/Z1");
+			this->activeCurve1 = L"Raw Δφ";
+			this->activeCurve2 = L"AM Z2/Z1";
 			UpdateChipStyles(1);
 			UpdateChipStyles(2);
+			UpdateSondeScheme();
 		}
 	}
 
 	System::Void MainForm::MainForm_FormClosing(System::Object^ sender, System::Windows::Forms::FormClosingEventArgs^ e)
 	{
+		if (this->telemetryRunning) StopTelemetry();
 		SaveStationConfig();
+	}
+
+	void MainForm::SetActiveSchemeChart(int chartIndex)
+	{
+		if (chartIndex != 0 && chartIndex != 1) return;
+		this->activeSchemeChart = chartIndex;
+		UpdateSondeScheme();
+	}
+
+	void MainForm::UpdateSondeScheme()
+	{
+		UpdateSondeScheme(false);
+	}
+
+	void MainForm::UpdateSondeScheme(bool useConnected)
+	{
+		if (this->sondeScheme == nullptr) return;
+		bool direct = (this->activeSchemeChart == 0) ? this->isDirectMode1 : this->isDirectMode2;
+		// Тип прибора: 351/352 — «Картограф» (схема с крайними Rx и DIRECT),
+		// остальные (231/242/349/151/152) — GP-приборы: только UNDIRECT, nTx катушек
+		bool connected = this->connectedSondeId != nullptr && this->deviceLink != nullptr &&
+			this->deviceLink->IsOpen && (useConnected || this->isLiveSession || !SondeData::IsLoaded());
+		bool identified = connected || SondeData::GetSignature() != 0;
+		SondeID id = connected ? *this->connectedSondeId : SondeID::FromSignature(SondeData::GetSignature());
+		int sondeType = identified ? id.type : 352;
+		int txCount = identified ? id.N_Tx : 4;
+		this->sondeScheme->SetDeviceCaption(identified ?
+			Utf8ToManaged(id.GetTypeName().c_str()) + L"  |  Тип " + id.type.ToString() +
+			L"  №" + id.number.ToString() : L"Прибор не определён");
+		bool carto = (sondeType == 351 || sondeType == 352);
+		ApplySondeTypeLayout(carto);
+		this->sondeScheme->SetState(this->activeSchemeChart, carto && direct, txCount, carto);
+		// Подсветка заголовка активного графика
+		if (this->panelTime1Header != nullptr)
+			this->panelTime1Header->BorderStyle = (this->activeSchemeChart == 0) ?
+				BorderStyle::FixedSingle : BorderStyle::None;
+		if (this->panelTime2Header != nullptr)
+			this->panelTime2Header->BorderStyle = (this->activeSchemeChart == 1) ?
+				BorderStyle::FixedSingle : BorderStyle::None;
+	}
+
+	System::Void MainForm::sondeScheme_SchemeClicked(System::Object^ sender, System::EventArgs^ e)
+	{
+		SetActiveSchemeChart(this->activeSchemeChart == 0 ? 1 : 0);
 	}
 }

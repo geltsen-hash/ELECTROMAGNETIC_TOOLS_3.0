@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <ctime>
 
 // Константы математические и физические
 #ifndef PI_CONST_DEF
@@ -33,6 +34,13 @@ inline bool is_cartograph(uint32_t type) {
 inline bool is_gp_sonde(uint32_t type) {
     return (type == AUTONOM_5Tx_ || type == CARTOGRAPH_LWD_4Tx_ || 
             type == LWD_4Tx_NEW_ || type == LWD_3Tx_ || type == AUTONOM_5Tx_SDR_);
+}
+
+// Масштаб амплитуд → мВ, зависит от типа прибора (AIR_TEMP_1.0 MyForm.h:3430–3448)
+inline float mVscale(uint32_t sonde_type) {
+    if (sonde_type == AUTONOM_5Tx_SDR_) return 3.6f;
+    if (is_cartograph(sonde_type) || sonde_type == CARTOGRAPH_LWD_4Tx_) return MV_SCALE;
+    return 1.0f;  // AUTONOM_5Tx, LWD_4Tx_NEW, LWD_3Tx — прибор уже отдаёт мВ
 }
 
 #pragma pack(push, 1)
@@ -131,6 +139,82 @@ struct GP_DATA {
 // Преамбула для файлов дампов памяти .DEV
 struct DEV_PREAMBLE {
     uint8_t raw[11];
+};
+
+// Настройки инклинометрии (часть METROLOGY_CARTOGRAPH, AIR_TEMP_1.0/variable.h)
+struct INC_SET {
+    uint32_t MA_WINDOW_SIZE;
+    uint32_t MLD_WINDOW_SIZE;
+    uint32_t N;
+    uint32_t K;
+    uint32_t auto_delta;
+    uint32_t INTERRUPT_BY_ANGLE_PATH;
+    float W_MIN;
+    float W_MAX;
+    float K_predict;
+    float APS_DELTA;
+    float history_angle;
+    float K_delta;
+};
+
+// Расписание работы передатчиков (часть METROLOGY_CARTOGRAPH)
+struct TURN_PRESETS {
+    uint32_t Tx[6];
+    uint32_t Tx_by_turn[3][5][6];
+    uint32_t tx_work_time_units[7];
+};
+
+// Константы сжатия для телесистемы (часть METROLOGY_CARTOGRAPH)
+struct REAP_CONST {
+    float ATT_max[2][4];
+    uint32_t ATT_grad[2][4];
+    float PH_max[2][4];
+    uint32_t PH_grad[2][4];
+};
+
+// Метрология ненаправленных зондов (240 байт, ответ на CMD_GET_METROLOGY)
+struct METROLOGY_GP {
+    uint32_t signature;
+    uint32_t serial;
+    uint16_t L1[5];
+    uint16_t L2[5];
+    uint16_t F[2];
+    int16_t air_ph[2][5];
+    int16_t min_amp[2][5];
+    uint32_t D_sonde_mm;
+    uint32_t work_type;
+    uint32_t Rx_Position;
+    float air_att_dB[2][5];
+    time_t timestamp;
+    uint16_t service[54];
+};
+
+// Метрология «Картографа»: общая часть METROLOGY_GP + блок направленных измерений
+struct METROLOGY_CARTOGRAPH {
+    uint32_t signature;
+    uint32_t serial;
+    uint16_t L1[5];
+    uint16_t L2[5];
+    uint16_t F[2];
+    int16_t air_ph[2][5];
+    int16_t min_amp[2][5];
+    uint32_t D_sonde_mm;
+    uint32_t work_type;
+    uint32_t Rx_Position;
+    float air_att_dB[2][5];
+    time_t timestamp;
+    uint16_t service[54];
+    // — конец общей части —
+    uint32_t L_geo_mm[5];
+    INC_SET inc_set;
+    TURN_PRESETS turn_presets;
+    uint64_t unix_epoh_data;
+    REAP_CONST reap;
+    uint32_t select_key;
+    float betta_Z_deg[2][2][4];
+    float V_zx_colar_add[2][2][4];
+    float d_ph_Vzx_Vzz_mG[2][2][4];
+    uint16_t service1[242];
 };
 
 #pragma pack(pop)

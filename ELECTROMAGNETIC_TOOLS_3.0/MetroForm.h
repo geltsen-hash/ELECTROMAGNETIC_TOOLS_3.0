@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include "DeviceLink.h"
+#include "SondeDataTypes.h"
+
 namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 	using namespace System;
@@ -17,11 +21,28 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 	public ref class MetroForm : public System::Windows::Forms::Form
 	{
 	public:
-		MetroForm(void)
+		MetroForm(void) : MetroForm(nullptr) {}
+
+		MetroForm(DeviceLink^ link)
 		{
+			this->sondeLink = link;
 			InitializeComponent();
 			InitDefaultValues();
+
+			// «Воздух» и «Пороги достоверности» — одна вкладка (как в старой программе —
+			// air_ph и min_amp соседние поля METROLOGY_GP)
+			this->tabPageAirOffsets->Text = L"Воздух и пороги достоверности";
+			this->groupBoxMinAmp->Dock = System::Windows::Forms::DockStyle::Bottom;
+			this->tabPageAirOffsets->Controls->Add(this->groupBoxMinAmp);
+			this->tabControlMetro->TabPages->Remove(this->tabPageThresholds);
+
+			// Метрология сессии → поля формы; не загружена — поля пустые
+			LoadSessionMetrology();
 		}
+
+		// Тип прибора из сигнатуры (как sells_load в старой программе):
+		// десятичная сигнатура, тип зонда, серийник; вкладка клинометрии — только для Картографа
+		void ApplySondeSignature(uint32_t signature);
 
 	protected:
 		/// <summary>
@@ -37,6 +58,20 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 	private:
 		System::ComponentModel::IContainer^ components;
+		DeviceLink^ sondeLink;
+
+		// Заполнение формы из структуры метрологии (как fill_the_form в старой программе).
+		// Общая часть у METROLOGY_GP и METROLOGY_CARTOGRAPH одинаковая.
+		void FillFromMetrology(const METROLOGY_GP* metro, bool hasLgeo, const uint32_t* Lgeo);
+		// Метрология сессии → форма; если не загружена — все поля пустые (как у старой)
+		void LoadSessionMetrology();
+		void ClearAllFields();
+		// Выбран Картограф — по сигнатуре в поле, иначе по комбобоксу типа
+		bool SelectedIsCartograph();
+		// Сбор структуры из полей формы (как validate_and_fill в старой программе)
+		bool CollectMetrologyGP(METROLOGY_GP* out, System::Collections::Generic::List<String^>^ errors);
+		bool CollectMetrologyCartograph(METROLOGY_CARTOGRAPH* out, System::Collections::Generic::List<String^>^ errors);
+		void ShowErrors(System::Collections::Generic::List<String^>^ errors, String^ action);
 
 		// Верхняя панель действий (Toolbar)
 		System::Windows::Forms::Panel^ panelTopBar;
@@ -70,6 +105,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		System::Windows::Forms::TextBox^ textBoxSerial;
 		System::Windows::Forms::Label^ labelSignature;
 		System::Windows::Forms::TextBox^ textBoxSignature;
+		System::Windows::Forms::Label^ labelStructSize;
+		System::Windows::Forms::TextBox^ textBoxStructSize;
 		System::Windows::Forms::Label^ labelDiameter;
 		System::Windows::Forms::TextBox^ textBoxDiameter;
 		System::Windows::Forms::Label^ labelFreq1;
@@ -223,6 +260,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->labelDiameter = (gcnew System::Windows::Forms::Label());
 			this->textBoxSignature = (gcnew System::Windows::Forms::TextBox());
 			this->labelSignature = (gcnew System::Windows::Forms::Label());
+			this->textBoxStructSize = (gcnew System::Windows::Forms::TextBox());
+			this->labelStructSize = (gcnew System::Windows::Forms::Label());
 			this->textBoxSerial = (gcnew System::Windows::Forms::TextBox());
 			this->labelSerial = (gcnew System::Windows::Forms::Label());
 			this->comboBoxSondeType = (gcnew System::Windows::Forms::ComboBox());
@@ -808,6 +847,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->groupBoxPassport->Controls->Add(this->textBoxDiameter);
 			this->groupBoxPassport->Controls->Add(this->labelDiameter);
 			this->groupBoxPassport->Controls->Add(this->textBoxSignature);
+			this->groupBoxPassport->Controls->Add(this->textBoxStructSize);
+			this->groupBoxPassport->Controls->Add(this->labelStructSize);
 			this->groupBoxPassport->Controls->Add(this->labelSignature);
 			this->groupBoxPassport->Controls->Add(this->textBoxSerial);
 			this->groupBoxPassport->Controls->Add(this->labelSerial);
@@ -884,9 +925,28 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->textBoxSignature->Font = (gcnew System::Drawing::Font(L"Segoe UI", 9));
 			this->textBoxSignature->Location = System::Drawing::Point(670, 42);
 			this->textBoxSignature->Name = L"textBoxSignature";
-			this->textBoxSignature->Size = System::Drawing::Size(120, 23);
+			this->textBoxSignature->Size = System::Drawing::Size(90, 23);
 			this->textBoxSignature->TabIndex = 5;
-			this->textBoxSignature->Text = L"0x24DD9";
+			this->textBoxSignature->Text = L"";
+			// 
+			// textBoxStructSize
+			// 
+			this->textBoxStructSize->Font = (gcnew System::Drawing::Font(L"Segoe UI", 9));
+			this->textBoxStructSize->Location = System::Drawing::Point(806, 42);
+			this->textBoxStructSize->Name = L"textBoxStructSize";
+			this->textBoxStructSize->Size = System::Drawing::Size(50, 23);
+			this->textBoxStructSize->TabIndex = 6;
+			this->textBoxStructSize->Text = L"";
+			// 
+			// labelStructSize
+			// 
+			this->labelStructSize->AutoSize = true;
+			this->labelStructSize->Font = (gcnew System::Drawing::Font(L"Segoe UI", 9));
+			this->labelStructSize->Location = System::Drawing::Point(766, 45);
+			this->labelStructSize->Name = L"labelStructSize";
+			this->labelStructSize->Size = System::Drawing::Size(38, 15);
+			this->labelStructSize->TabIndex = 12;
+			this->labelStructSize->Text = L"Байт:";
 			// 
 			// labelSignature
 			// 

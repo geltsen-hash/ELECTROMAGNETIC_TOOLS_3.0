@@ -1,5 +1,11 @@
 #pragma once
 
+#include "SondeSchemeControl.h"
+#include "DeviceLink.h"
+#include "ToolProtocol.h"
+#include "ConnectionConfig.h"
+#include "ConnectionForm.h"
+
 namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 	using namespace System;
@@ -23,6 +29,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		{
 			InitializeComponent();
 			InitChartEngine();
+			InitConnection();
 		}
 
 	protected:
@@ -31,6 +38,22 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		/// </summary>
 		~MainForm()
 		{
+			telemetryRunning = false;
+			if (deviceLink != nullptr)
+			{
+				deviceLink->Close();
+			}
+			if (connectedSondeId != nullptr)
+			{
+				delete connectedSondeId;
+				connectedSondeId = nullptr;
+			}
+			if (liveFout != nullptr)
+			{
+				if (liveFout->is_open()) liveFout->close();
+				delete liveFout;
+				liveFout = nullptr;
+			}
 			if (components)
 			{
 				delete components;
@@ -59,6 +82,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		System::Windows::Forms::MenuStrip^ menuStripMain;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemFile;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemOpenBin;
+		System::Windows::Forms::ToolStripMenuItem^ menuItemOpenTemp;
+		System::Windows::Forms::ToolStripMenuItem^ menuItemClearTemp;
 		System::Windows::Forms::ToolStripSeparator^ menuItemSep1;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemExit;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemView;
@@ -66,6 +91,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		System::Windows::Forms::ToolStripMenuItem^ menuItemComm;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemConnect;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemDisconnect;
+		System::Windows::Forms::ToolStripSeparator^ menuItemSepComm;
+		System::Windows::Forms::ToolStripMenuItem^ menuItemConnSettings;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemMetro;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemMetroParams;
 		System::Windows::Forms::ToolStripMenuItem^ menuItemMetroCalibrate;
@@ -136,6 +163,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 
 		// Всплывающие подсказки
 		System::Windows::Forms::ToolTip^ toolTipMain;
+		String^ lastChartTooltip;  // последний текст подсказки на графике (чтобы не дёргать ToolTip)
 
 		// Главные сплиттеры (поэтажная компоновка комплексов)
 		System::Windows::Forms::SplitContainer^ splitContainerRows;
@@ -250,6 +278,32 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		String^ activeCurve2;
 		bool isDirectMode1;
 		bool isDirectMode2;
+		bool isCartographLayout;
+		int receiverIndex1;
+		int receiverIndex2;
+		System::Windows::Forms::Button^ buttonReceiver1;
+		System::Windows::Forms::Button^ buttonReceiver2;
+		cli::array<List<String^>^>^ modePinnedCurves;
+		cli::array<String^>^ modeActiveCurves;
+		void RememberChartMode(int windowIndex);
+		void AppendModeConfig(System::Text::StringBuilder^ builder, int windowIndex);
+		bool LoadModeConfigLine(int windowIndex, String^ line);
+		void SetChartMode(int windowIndex, bool direct);
+		void UpdateChartPalette(int windowIndex);
+		void RenderChart(int windowIndex);
+		void RefreshChart(int windowIndex);
+		void UpdateChartHeaderControls();
+		System::Void buttonReceiver_Click(System::Object^ sender, System::EventArgs^ e);
+		// Схема зондов, привязанная к активному графику (0 = верхний, 1 = нижний)
+		SondeSchemeControl^ sondeScheme;
+		int activeSchemeChart;
+		void UpdateSondeScheme();
+		void UpdateSondeScheme(bool useConnected);
+		void SetActiveSchemeChart(int chartIndex);
+		System::Void sondeScheme_SchemeClicked(System::Object^ sender, System::EventArgs^ e);
+		// Раскладка по типу прибора: у GP-приборов секторные окна скрываются
+		void ApplySondeTypeLayout(bool isCarto);
+		bool sectorsCollapsedByUser;
 		bool isTempXAxis1;
 		bool isTempXAxis2;
 		int precisionY1;
@@ -264,6 +318,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		Drawing::Point panStartPoint2;
 		bool isPanning1;
 		bool isPanning2;
+		int lastShownTxCount;   // последняя показанная конфигурация передатчиков (для сброса чекбоксов Tx)
 
 		void UpdateTxControlsVisibility();
 		void ExportCsv(int windowIndex);
@@ -271,9 +326,38 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		void RunGpAnalysis(String^ csvPath);
 		System::Void menuExportCsv_Click(System::Object^ sender, System::EventArgs^ e);
 
+		// Общий канал связи с прибором (телеметрия + стендовая калибровка)
+		DeviceLink^ deviceLink;
+		SondeID* connectedSondeId;
+		void InitConnection();
+		void SyncConnectionPanel();
+		System::Void menuItemConnSettings_Click(System::Object^ sender, System::EventArgs^ e);
+
 		// Состояние потока данных и разделителей
 		bool isStreaming;
 		int currentStreamPoint;
+
+		// --- Онлайн-телеметрия по общему каналу deviceLink ---
+		// Фоновый поток опросов CMD_GET_DATA → очередь кадров → насос timerStream (UI)
+		System::Threading::Thread^ telemetryThread;
+		bool telemetryRunning;
+		System::Collections::Concurrent::ConcurrentQueue<cli::array<Byte>^>^ frameQueue;
+		unsigned long telemetryRx;
+		unsigned long telemetryTimeouts;
+		unsigned long telemetryCrcErr;
+		std::ofstream* liveFout;                 // запись принятых кадров в BIN
+		System::String^ liveFileName;
+		System::String^ liveFilePath;
+		void TelemetryWorker();
+		void StartTelemetry();   // запуск опроса+записи (вызывается из «Подключить»)
+		void StopTelemetry();    // остановка опроса+записи (вызывается из «Отключить»/закрытия)
+		void StartDisplay();     // «ПОТОК» вкл — только отображение окна (как surf в старой)
+		void StopDisplay();      // «ПОТОК» выкл — запись продолжается
+		bool isLiveSession;      // память содержит онлайн-кадры (не данные открытого файла)
+		System::String^ LiveFileBase();    // имя временного файла по типу прибора
+		System::String^ LiveFileFullPath(); // путь = data_folder + имя (создает папку)
+		void DrainFrameQueue();
+		void AppendFrameToCharts(size_t frameIdx);
 		bool isSyncingSplitter;
 		bool isSidebarPinned;
 
@@ -285,9 +369,15 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		void InitializeComponent(void)
 		{
 			this->components = (gcnew System::ComponentModel::Container());
+			System::Windows::Forms::DataVisualization::Charting::ChartArea^ chartArea5 = (gcnew System::Windows::Forms::DataVisualization::Charting::ChartArea());
+			System::Windows::Forms::DataVisualization::Charting::ChartArea^ chartArea6 = (gcnew System::Windows::Forms::DataVisualization::Charting::ChartArea());
+			System::Windows::Forms::DataVisualization::Charting::ChartArea^ chartArea7 = (gcnew System::Windows::Forms::DataVisualization::Charting::ChartArea());
+			System::Windows::Forms::DataVisualization::Charting::ChartArea^ chartArea8 = (gcnew System::Windows::Forms::DataVisualization::Charting::ChartArea());
 			this->menuStripMain = (gcnew System::Windows::Forms::MenuStrip());
 			this->menuItemFile = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemOpenBin = (gcnew System::Windows::Forms::ToolStripMenuItem());
+			this->menuItemOpenTemp = (gcnew System::Windows::Forms::ToolStripMenuItem());
+			this->menuItemClearTemp = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemSep1 = (gcnew System::Windows::Forms::ToolStripSeparator());
 			this->menuItemExit = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemView = (gcnew System::Windows::Forms::ToolStripMenuItem());
@@ -295,6 +385,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->menuItemComm = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemConnect = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemDisconnect = (gcnew System::Windows::Forms::ToolStripMenuItem());
+			this->menuItemSepComm = (gcnew System::Windows::Forms::ToolStripSeparator());
+			this->menuItemConnSettings = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemMetro = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemMetroParams = (gcnew System::Windows::Forms::ToolStripMenuItem());
 			this->menuItemMetroCalibrate = (gcnew System::Windows::Forms::ToolStripMenuItem());
@@ -501,9 +593,9 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// 
 			// menuItemFile
 			// 
-			this->menuItemFile->DropDownItems->AddRange(gcnew cli::array< System::Windows::Forms::ToolStripItem^  >(3) {
+			this->menuItemFile->DropDownItems->AddRange(gcnew cli::array< System::Windows::Forms::ToolStripItem^  >(5) {
 				this->menuItemOpenBin,
-					this->menuItemSep1, this->menuItemExit
+					this->menuItemOpenTemp, this->menuItemClearTemp, this->menuItemSep1, this->menuItemExit
 			});
 			this->menuItemFile->Name = L"menuItemFile";
 			this->menuItemFile->Size = System::Drawing::Size(61, 25);
@@ -513,19 +605,33 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// 
 			this->menuItemOpenBin->Name = L"menuItemOpenBin";
 			this->menuItemOpenBin->ShortcutKeys = static_cast<System::Windows::Forms::Keys>((System::Windows::Forms::Keys::Control | System::Windows::Forms::Keys::O));
-			this->menuItemOpenBin->Size = System::Drawing::Size(331, 26);
+			this->menuItemOpenBin->Size = System::Drawing::Size(345, 26);
 			this->menuItemOpenBin->Text = L"&Открыть файл данных...";
 			this->menuItemOpenBin->Click += gcnew System::EventHandler(this, &MainForm::menuItemOpenBin_Click);
+			// 
+			// menuItemOpenTemp
+			// 
+			this->menuItemOpenTemp->Name = L"menuItemOpenTemp";
+			this->menuItemOpenTemp->Size = System::Drawing::Size(345, 26);
+			this->menuItemOpenTemp->Text = L"Открыть временный файл данных";
+			this->menuItemOpenTemp->Click += gcnew System::EventHandler(this, &MainForm::menuItemOpenTemp_Click);
+			// 
+			// menuItemClearTemp
+			// 
+			this->menuItemClearTemp->Name = L"menuItemClearTemp";
+			this->menuItemClearTemp->Size = System::Drawing::Size(345, 26);
+			this->menuItemClearTemp->Text = L"Очистить временный файл данных";
+			this->menuItemClearTemp->Click += gcnew System::EventHandler(this, &MainForm::menuItemClearTemp_Click);
 			// 
 			// menuItemSep1
 			// 
 			this->menuItemSep1->Name = L"menuItemSep1";
-			this->menuItemSep1->Size = System::Drawing::Size(328, 6);
+			this->menuItemSep1->Size = System::Drawing::Size(342, 6);
 			// 
 			// menuItemExit
 			// 
 			this->menuItemExit->Name = L"menuItemExit";
-			this->menuItemExit->Size = System::Drawing::Size(331, 26);
+			this->menuItemExit->Size = System::Drawing::Size(345, 26);
 			this->menuItemExit->Text = L"&Выход";
 			this->menuItemExit->Click += gcnew System::EventHandler(this, &MainForm::menuItemExit_Click);
 			// 
@@ -546,9 +652,9 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// 
 			// menuItemComm
 			// 
-			this->menuItemComm->DropDownItems->AddRange(gcnew cli::array< System::Windows::Forms::ToolStripItem^  >(2) {
+			this->menuItemComm->DropDownItems->AddRange(gcnew cli::array< System::Windows::Forms::ToolStripItem^  >(4) {
 				this->menuItemConnect,
-					this->menuItemDisconnect
+					this->menuItemDisconnect, this->menuItemSepComm, this->menuItemConnSettings
 			});
 			this->menuItemComm->Name = L"menuItemComm";
 			this->menuItemComm->Size = System::Drawing::Size(65, 25);
@@ -568,6 +674,18 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->menuItemDisconnect->Size = System::Drawing::Size(185, 26);
 			this->menuItemDisconnect->Text = L"&Отключить";
 			this->menuItemDisconnect->Click += gcnew System::EventHandler(this, &MainForm::buttonDisconnect_Click);
+			// 
+			// menuItemSepComm
+			// 
+			this->menuItemSepComm->Name = L"menuItemSepComm";
+			this->menuItemSepComm->Size = System::Drawing::Size(182, 6);
+			// 
+			// menuItemConnSettings
+			// 
+			this->menuItemConnSettings->Name = L"menuItemConnSettings";
+			this->menuItemConnSettings->Size = System::Drawing::Size(185, 26);
+			this->menuItemConnSettings->Text = L"Настройки...";
+			this->menuItemConnSettings->Click += gcnew System::EventHandler(this, &MainForm::menuItemConnSettings_Click);
 			// 
 			// menuItemMetro
 			// 
@@ -623,7 +741,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// menuItemAbout
 			// 
 			this->menuItemAbout->Name = L"menuItemAbout";
-			this->menuItemAbout->Size = System::Drawing::Size(224, 26);
+			this->menuItemAbout->Size = System::Drawing::Size(199, 26);
 			this->menuItemAbout->Text = L"&О программе...";
 			this->menuItemAbout->Click += gcnew System::EventHandler(this, &MainForm::menuItemAbout_Click);
 			// 
@@ -1068,6 +1186,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// 
 			// chartTime1
 			// 
+			chartArea5->Name = L"ChartArea1";
+			this->chartTime1->ChartAreas->Add(chartArea5);
 			this->chartTime1->ContextMenuStrip = this->contextMenuChart1;
 			this->chartTime1->Controls->Add(this->buttonZoomReset1);
 			this->chartTime1->Dock = System::Windows::Forms::DockStyle::Fill;
@@ -1285,7 +1405,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx1_5->Checked = true;
 			this->checkTx1_5->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx1_5->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx1_5->ForeColor = System::Drawing::Color::DarkViolet;
+			this->checkTx1_5->ForeColor = System::Drawing::Color::Magenta;
 			this->checkTx1_5->Location = System::Drawing::Point(152, 33);
 			this->checkTx1_5->Name = L"checkTx1_5";
 			this->checkTx1_5->Size = System::Drawing::Size(54, 23);
@@ -1300,7 +1420,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx1_4->Checked = true;
 			this->checkTx1_4->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx1_4->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx1_4->ForeColor = System::Drawing::Color::DarkOrange;
+			this->checkTx1_4->ForeColor = System::Drawing::Color::RoyalBlue;
 			this->checkTx1_4->Location = System::Drawing::Point(114, 33);
 			this->checkTx1_4->Name = L"checkTx1_4";
 			this->checkTx1_4->Size = System::Drawing::Size(54, 23);
@@ -1315,7 +1435,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx1_3->Checked = true;
 			this->checkTx1_3->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx1_3->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx1_3->ForeColor = System::Drawing::Color::ForestGreen;
+			this->checkTx1_3->ForeColor = System::Drawing::Color::Red;
 			this->checkTx1_3->Location = System::Drawing::Point(76, 33);
 			this->checkTx1_3->Name = L"checkTx1_3";
 			this->checkTx1_3->Size = System::Drawing::Size(54, 23);
@@ -1330,7 +1450,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx1_2->Checked = true;
 			this->checkTx1_2->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx1_2->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx1_2->ForeColor = System::Drawing::Color::Crimson;
+			this->checkTx1_2->ForeColor = System::Drawing::Color::DarkGoldenrod;
 			this->checkTx1_2->Location = System::Drawing::Point(38, 33);
 			this->checkTx1_2->Name = L"checkTx1_2";
 			this->checkTx1_2->Size = System::Drawing::Size(54, 23);
@@ -1345,7 +1465,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx1_1->Checked = true;
 			this->checkTx1_1->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx1_1->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx1_1->ForeColor = System::Drawing::Color::RoyalBlue;
+			this->checkTx1_1->ForeColor = System::Drawing::Color::Green;
 			this->checkTx1_1->Location = System::Drawing::Point(2, 33);
 			this->checkTx1_1->Name = L"checkTx1_1";
 			this->checkTx1_1->Size = System::Drawing::Size(54, 23);
@@ -1430,6 +1550,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// 
 			// chartSectorRxL
 			// 
+			chartArea6->Name = L"ChartArea1";
+			this->chartSectorRxL->ChartAreas->Add(chartArea6);
 			this->chartSectorRxL->Dock = System::Windows::Forms::DockStyle::Fill;
 			this->chartSectorRxL->Location = System::Drawing::Point(0, 32);
 			this->chartSectorRxL->Name = L"chartSectorRxL";
@@ -1578,6 +1700,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// 
 			// chartTime2
 			// 
+			chartArea7->Name = L"ChartArea1";
+			this->chartTime2->ChartAreas->Add(chartArea7);
 			this->chartTime2->ContextMenuStrip = this->contextMenuChart2;
 			this->chartTime2->Controls->Add(this->buttonZoomReset2);
 			this->chartTime2->Dock = System::Windows::Forms::DockStyle::Fill;
@@ -1795,7 +1919,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx2_5->Checked = true;
 			this->checkTx2_5->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx2_5->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx2_5->ForeColor = System::Drawing::Color::DarkViolet;
+			this->checkTx2_5->ForeColor = System::Drawing::Color::Magenta;
 			this->checkTx2_5->Location = System::Drawing::Point(152, 33);
 			this->checkTx2_5->Name = L"checkTx2_5";
 			this->checkTx2_5->Size = System::Drawing::Size(54, 23);
@@ -1810,7 +1934,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx2_4->Checked = true;
 			this->checkTx2_4->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx2_4->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx2_4->ForeColor = System::Drawing::Color::DarkOrange;
+			this->checkTx2_4->ForeColor = System::Drawing::Color::RoyalBlue;
 			this->checkTx2_4->Location = System::Drawing::Point(114, 33);
 			this->checkTx2_4->Name = L"checkTx2_4";
 			this->checkTx2_4->Size = System::Drawing::Size(54, 23);
@@ -1825,7 +1949,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx2_3->Checked = true;
 			this->checkTx2_3->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx2_3->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx2_3->ForeColor = System::Drawing::Color::ForestGreen;
+			this->checkTx2_3->ForeColor = System::Drawing::Color::Red;
 			this->checkTx2_3->Location = System::Drawing::Point(76, 33);
 			this->checkTx2_3->Name = L"checkTx2_3";
 			this->checkTx2_3->Size = System::Drawing::Size(54, 23);
@@ -1840,7 +1964,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx2_2->Checked = true;
 			this->checkTx2_2->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx2_2->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx2_2->ForeColor = System::Drawing::Color::Crimson;
+			this->checkTx2_2->ForeColor = System::Drawing::Color::DarkGoldenrod;
 			this->checkTx2_2->Location = System::Drawing::Point(38, 33);
 			this->checkTx2_2->Name = L"checkTx2_2";
 			this->checkTx2_2->Size = System::Drawing::Size(54, 23);
@@ -1855,7 +1979,7 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			this->checkTx2_1->Checked = true;
 			this->checkTx2_1->CheckState = System::Windows::Forms::CheckState::Checked;
 			this->checkTx2_1->Font = (gcnew System::Drawing::Font(L"Segoe UI", 8, System::Drawing::FontStyle::Bold));
-			this->checkTx2_1->ForeColor = System::Drawing::Color::RoyalBlue;
+			this->checkTx2_1->ForeColor = System::Drawing::Color::Green;
 			this->checkTx2_1->Location = System::Drawing::Point(2, 33);
 			this->checkTx2_1->Name = L"checkTx2_1";
 			this->checkTx2_1->Size = System::Drawing::Size(54, 23);
@@ -1940,6 +2064,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 			// 
 			// chartSectorRxR
 			// 
+			chartArea8->Name = L"ChartArea1";
+			this->chartSectorRxR->ChartAreas->Add(chartArea8);
 			this->chartSectorRxR->Dock = System::Windows::Forms::DockStyle::Fill;
 			this->chartSectorRxR->Location = System::Drawing::Point(0, 32);
 			this->chartSectorRxR->Name = L"chartSectorRxR";
@@ -2398,6 +2524,8 @@ namespace ELECTROMAGNETIC_TOOLS_3_0 {
 		System::Void menuItemCalibMaster_Click(System::Object^ sender, System::EventArgs^ e);
 		System::Void menuItemMetroParams_Click(System::Object^ sender, System::EventArgs^ e);
 		System::Void menuItemOpenBin_Click(System::Object^ sender, System::EventArgs^ e);
+		System::Void menuItemClearTemp_Click(System::Object^ sender, System::EventArgs^ e);
+		System::Void menuItemOpenTemp_Click(System::Object^ sender, System::EventArgs^ e);
 		System::Void menuItemExit_Click(System::Object^ sender, System::EventArgs^ e);
 		System::Void menuItemAbout_Click(System::Object^ sender, System::EventArgs^ e);
 

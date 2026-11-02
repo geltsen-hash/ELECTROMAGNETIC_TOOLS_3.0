@@ -95,7 +95,14 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="SondeDataTypes.h" />
     <ClInclude Include="BinFileReader.h" />
+    <ClInclude Include="SondeSchemeControl.h" />
+    <ClInclude Include="DeviceLink.h" />
+    <ClInclude Include="ToolProtocol.h" />
+    <ClInclude Include="ConnectionConfig.h" />
     <ClInclude Include="MainForm.h">
+      <FileType>CppForm</FileType>
+    </ClInclude>
+    <ClInclude Include="ConnectionForm.h">
       <FileType>CppForm</FileType>
     </ClInclude>
     <ClInclude Include="MetroForm.h">
@@ -112,6 +119,7 @@
       <CompileAsManaged>false</CompileAsManaged>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="ConnectionForm.cpp" />
     <ClCompile Include="MainForm.cpp" />
     <ClCompile Include="MetroForm.cpp" />
     <ClCompile Include="main.cpp" />

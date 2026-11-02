@@ -34,6 +34,7 @@ ELECTROMAGNETIC_TOOLS_3.0/Release/
 # Logs and temporary files
 *.log
 *.tmp
+/nul
 
 # Test / large data
 *.las

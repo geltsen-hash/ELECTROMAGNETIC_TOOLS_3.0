@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include "SondeDataTypes.h"
 
 namespace SondeData {
 
@@ -34,7 +36,16 @@ namespace SondeData {
         CURVE_ANGULAR_VELOCITY = 23,  // Угловая скорость (ANGULAR_VELOCITY)
         CURVE_START_SECTOR = 24,      // Стартовый сектор (START_SECTOR)
         CURVE_TEMP_RZX = 25,          // Температура RZX
-        CURVE_DEPTH = 26              // Глубина (DEPTH)
+        CURVE_DEPTH = 26,             // Глубина (DEPTH)
+
+        CURVE_ATT_SMT = 27,           // ATT SMT — затухание из прибора (att_dB_smt)
+        CURVE_GEO_AM_SMT = 28,        // AM GEO SMT — сглаженная гео-амплитуда (ATT_dB_geo_signal_smt)
+        CURVE_GEO_PH_SMT = 29,        // φ GEO SMT — сглаженная гео-фаза (PH_deg_geo_signal_smt)
+        CURVE_ERROR_RHO = 30,         // ε RO — невязка УЭС (заглушка до PC-пересчёта)
+        CURVE_PHASE_SMT_PC = 31,
+        CURVE_RHO_PHASE_PC = 32,
+        CURVE_ATT_SMT_PC = 33,
+        CURVE_RHO_ATT_PC = 34
     };
 
     struct SectorAnalysis {
@@ -57,10 +68,22 @@ namespace SondeData {
     // Очистка сессии
     void CloseFile();
 
+    // --- Онлайн-телеметрия ---
+    // Начать живую сессию (очищает буфер кадров)
+    void BeginLiveSession();
+    // Добавить принятый кадр телеметрии (как в файловом формате):
+    //   GP — целая запись по размеру из сигнатуры;
+    //   Картограф — DATA+RAW одной частоты (1536 Б, dds_freq 401/2001),
+    //   половинки собираются в ALL_DATA. Возврат: число новых полных кадров.
+    size_t AppendLiveRecord(const uint8_t* data, size_t len);
+    // Полный кадр последней записи для записи в BIN (nullptr, len 0 если нет)
+    bool GetLastRecordBytes(const uint8_t** data, size_t* len);
+
     // Параметры загруженного зонда
     size_t GetFrameCount();
     int GetSondeType();
     int GetTxCount();
+    uint32_t GetSignature();
     const char* GetSondeName();
     const char* GetFileName();
 
@@ -76,11 +99,24 @@ namespace SondeData {
         size_t& exportedFrames, char* errorBuf, size_t errorBufLen);
 
     // Значение кривой для кадра frameIdx (кадр 0..N-1, частота 0=400, 1=2000, передатчик 0..Tx-1)
-    double GetCurveValue(int curveType, int freqIdx, int txIdx, size_t frameIdx);
+    double GetCurveValue(int curveType, int freqIdx, int txIdx, size_t frameIdx, int rxIdx = 0);
 
     // Получение температуры кадра
     double GetTemperature(size_t frameIdx);
 
     // Получение 16 секторов и спектрального анализа первой гармоники
     bool GetSectorData(int rxIdx, int freqIdx, int txIdx, size_t frameIdx, SectorAnalysis& analysis);
+
+    // --- Метрология прибора (аналог metrology_GP_struct / metrology_cartograf_struct) ---
+    // Сохранить структуру из сырых байт (ответ прибора / файл): вид определяется
+    // сигнатурой — Картограф или METROLOGY_GP. Возврат: данные приняты.
+    bool SetMetrology(const uint8_t* data, size_t len);
+    void SetMetrologyGP(const METROLOGY_GP* metro);
+    void SetMetrologyCartograph(const METROLOGY_CARTOGRAPH* metro);
+    void ClearMetrology();
+    bool HasMetrology();
+    bool IsMetrologyCartograph();
+    const METROLOGY_GP* GetMetrologyGP();          // nullptr если нет данных
+    const METROLOGY_CARTOGRAPH* GetMetrologyCartograph();
+    uint32_t GetMetrologySignature();
 }

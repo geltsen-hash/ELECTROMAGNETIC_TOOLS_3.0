@@ -24,6 +24,21 @@
     <ClInclude Include="BinFileReader.h">
       <Filter>Файлы заголовков</Filter>
     </ClInclude>
+    <ClInclude Include="SondeSchemeControl.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
+    <ClInclude Include="DeviceLink.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
+    <ClInclude Include="ToolProtocol.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
+    <ClInclude Include="ConnectionConfig.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
+    <ClInclude Include="ConnectionForm.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
     <ClInclude Include="MainForm.h">
       <Filter>Файлы заголовков</Filter>
     </ClInclude>
@@ -39,6 +54,9 @@
       <Filter>Исходные файлы</Filter>
     </ClCompile>
     <ClCompile Include="BinFileReader.cpp">
+      <Filter>Исходные файлы</Filter>
+    </ClCompile>
+    <ClCompile Include="ConnectionForm.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
     <ClCompile Include="MainForm.cpp">
