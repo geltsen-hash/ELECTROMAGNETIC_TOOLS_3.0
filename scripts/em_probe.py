@@ -87,6 +87,9 @@ METRO_FILES = {
 def metro_path(sonde_type):
     return os.path.join(SCRIPT_DIR, METRO_FILES.get(sonde_type, "metro_%d.bin" % sonde_type))
 
+# Последний выбор пульта — файл рядом со скриптом, восстанавливается при старте
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "emprobe_config.json")
+
 # Таблица CRC16 (Modbus) — побайтовый перенос из variable.cpp
 CRC_TABLE = (
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
@@ -861,6 +864,18 @@ class ProbeModel:
         struct.pack_into("<II", blob, 0, self.signature(), self.serial)
         return bytes(blob)
 
+    def save_config(self):
+        """Запомнить текущий выбор прибора и модели в JSON."""
+        with self.lock:
+            cfg = {"sonde_type": self.sonde_type, "serial": self.serial,
+                   "struct_size": self.struct_size,
+                   "model_file": os.path.basename(self.model_path) if self.model_frames else ""}
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f)
+        except OSError:
+            pass
+
     def load_model(self, path):
         """Загрузить файл-модель телеметрии; прибор = то, что записано в файле."""
         frames, sig = load_model_file(path)  # ошибки — наружу, ловит пульт
@@ -1225,6 +1240,7 @@ def make_remote_handler(model: ProbeModel):
                 params = {k: v[0] for k, v in urllib.parse.parse_qs(form).items()}
                 if params.get("action") == "off":
                     model.clear_model()
+                    model.save_config()
                 else:
                     path = params.get("model_path", "").strip()
                     if not path:
@@ -1234,6 +1250,7 @@ def make_remote_handler(model: ProbeModel):
                     if path:
                         try:
                             model.load_model(path)
+                            model.save_config()
                         except (OSError, ValueError, struct.error) as e:
                             model.log_cmd("Модель не загружена: %s" % e)
                 self.send_response(303)
@@ -1252,6 +1269,7 @@ def make_remote_handler(model: ProbeModel):
                 model.configure(int(params.get("sonde_type", model.sonde_type)),
                                 int(params.get("serial", model.serial)),
                                 int(params.get("struct_size", model.struct_size)))
+                model.save_config()
             except ValueError as error:
                 self.send_error(400, str(error).encode("ascii", "replace").decode("ascii"))
                 return
@@ -1291,6 +1309,17 @@ def main():
     args = ap.parse_args()
 
     model = ProbeModel(args.sonde, args.serial)
+    # Восстановить последний выбор пульта (перекрывает аргументы запуска)
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        model.configure(int(cfg["sonde_type"]), int(cfg["serial"]),
+                        int(cfg["struct_size"]))
+        model_file = cfg.get("model_file", "")
+        if model_file:
+            model.load_model(os.path.join(SCRIPT_DIR, model_file))
+    except (OSError, ValueError, KeyError, struct.error):
+        pass
     stop = threading.Event()
 
     # Поток имитации движения

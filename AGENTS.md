@@ -53,6 +53,12 @@
 * Новая метрология при отсутствии файла: beta=45°, collar=0, фазовые поправки=0, REAP из прошивки. Существующие файлы не переписываются. Это нейтральные начальные коэффициенты, а не измеренная калибровка.
 * `python test_em_probe.py` также проверяет Картограф, RAW-модель, DEV, смену метрологии, нулевые недопустимые результаты и select_key. `python test_pc_curves.py` сравнивает направленные результаты и упаковку с native-портом исходных функций прошивки. В harness учитывается 16-битный байт C2000 при переносе memset/memcpy/out_arr; исходники прошивки не изменяются.
 
+## Эмулятор на Raspberry Pi 3B
+* Pi 3B, RPi OS Trixie (cloud-init). Пользователь `user`/`1234`, SSH по паролю, sudo NOPASSWD. Точка доступа `emprobe-ap`: SSID `EMK-EMULEATOR`, **открытая**, канал 6, `ipv4.method shared` + `192.168.4.1/24` — как у реального прибора (WPA2 на brcmfmac нестабилен). Pi = `192.168.4.1`: станция → UDP 5000, пульт → `http://192.168.4.1:8080`, SSH/SCP — туда же. Ethernet — резерв.
+* Автозапуск — `emprobe.service` (systemd, enabled): `python3 /home/user/emprobe/em_probe.py --bind 0.0.0.0 --port 5000 --http 8080 --sonde 352 --serial 5`, Restart=always. Логи: `journalctl -u emprobe`.
+* Выбор пульта (тип/серия/размер GP/модель) сохраняется в `emprobe_config.json` рядом со скриптом и восстанавливается при старте поверх CLI-аргументов; файл в .gitignore.
+* Развёртывание: cloud-init читает seed с bootfs только при `ds=nocloud;i=<id>` в `cmdline.txt` (ставит Raspberry Pi Imager при кастомизации); `firstrun.sh`/`systemd.run` ненадёжны. Файлы копировать через bootfs-папку `emprobe/` в `~/emprobe/`. Pi 3B — только 2.4 ГГц.
+
 ## Проверка кривых Sonde / PC
 * `python test_pc_curves.py` компилирует временный native C++ harness через VS 2026 и сравнивает PC-УЭС с исходными `RO_ARG`/`RO_AMP` из соседнего `TEST_SONDE_KARTOGRAF_2.0/AIR_TEMP_1.0/variable.cpp`. Проверяет 3Tx/4Tx/5Tx, обе частоты, пределы диапазона, отсутствие метрологии, недопустимые амплитуды и неизменность исходных кадров/Sonde-полей.
 * PC повторяет фактическую логику старого `simmetry`: маска condition принудительно обнулена, матрица единичная; применяются воздух и чередование знака. Это не реализация адаптивной симметризации по работоспособности Tx.

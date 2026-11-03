@@ -7,6 +7,15 @@
 
 ---
 
+## Checkpoint 02.11.2026 — эмулятор на Raspberry Pi 3B развёрнут
+
+- **Pi:** Raspberry Pi 3B, RPi OS Trixie (pi-gen + cloud-init), hostname `EMK`, пользователь `user`/`1234` (sudo NOPASSWD), SSH по паролю. Управление по Ethernet, сейчас `192.168.1.23` (DHCP — адрес может меняться, искать по SSH-баннеру или в DHCP-листе).
+- **AP:** NM-профиль `emprobe-ap`: SSID `EMK-EMULEATOR`, **открытая сеть** (пароль убран — WPA2-PSK на brcmfmac не проходил handshake у клиентов), канал 6, `ipv4.method shared` + `192.168.4.1/24` — имитация адресации прибора. ПК и телефон подключаются.
+- **Эмулятор:** `~/emprobe/em_probe.py` + metro_*.bin + model_*.bin (скопированы из `scripts/` через bootfs). systemd-юнит `emprobe.service` (enabled, active): `--bind 0.0.0.0 --port 5000 --http 8080 --sonde 352 --serial 5`, Restart=always. UDP GET_SIGNATURE/GET_DATA и веб-пульт проверены с ПК. Pi работает автономно по Wi-Fi: SSH/пульт/UDP — всё на `192.168.4.1`, Ethernet лишь резерв.
+- **Персистентность эмулятора:** выбор пульта (тип/серия/размер GP/файл-модель) пишется в `emprobe_config.json` рядом со скриптом и восстанавливается при старте поверх аргументов (файл gitignored). Проверено рестартом на Pi: тип 151 №7 вернулся сам.
+- **Уроки:** cloud-init на этом образе читает seed с bootfs только при `ds=nocloud;i=<id>` в `cmdline.txt` (пишет Imager при кастомизации). `firstrun.sh`/`systemd.run` на образе не работают/ненадёжны. Pi 3B — только 2.4 ГГц; домашняя 5-ГГц сеть недоступна. Для AP на brcmfmac нужны `wifi-sec.proto rsn pairwise/group ccmp` (SHA256-вариант даёт «key setting validation failed»), но и с ними WPA2 нестабилен → открытая сеть.
+- **Открыто:** не проверено подключение станции по Wi-Fi AP (подключить ПК к EMK-EMULEATOR, цель 192.168.4.1:5000); `test_em_probe.py` на Pi не прогонялся.
+
 ## Checkpoint 01.11.2026 — переход в новую сессию
 
 Этот checkpoint актуальнее исторических разделов ниже. Для начала достаточно его и `AGENTS.md`; подробности читать по задаче.

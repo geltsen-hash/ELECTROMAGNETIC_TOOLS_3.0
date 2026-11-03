@@ -49,3 +49,4 @@ __pycache__/
 # Local agent configuration
 .devin/*.local.json
 
+emprobe_config.json
